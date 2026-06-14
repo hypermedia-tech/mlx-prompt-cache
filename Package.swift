@@ -23,7 +23,11 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "MLXPromptCache"
+            name: "MLXPromptCache",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ]
         ),
         .executableTarget(
             name: "MLXPromptCacheScratch",
@@ -31,7 +35,11 @@ let package = Package(
         ),
         .testTarget(
             name: "MLXPromptCacheTests",
-            dependencies: ["MLXPromptCache"]
+            dependencies: [
+                "MLXPromptCache",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

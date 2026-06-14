@@ -72,4 +72,24 @@ struct Catalog: Codable {
         }
         return name
     }
+    
+    /// Load the persisted catalog, or start fresh. Wipes on signature/blockSize change or a
+    /// missing/corrupt index (greenfield — no migration); drops entries whose snapshot file is gone.
+    static func loadOrReset(directory: URL, signature: CacheSignature, blockSize: Int) -> Catalog {
+        let url = directory.appendingPathComponent("index.json")
+        guard let data = try? Data(contentsOf: url),
+              var loaded = try? JSONDecoder().decode(Catalog.self, from: data),
+              loaded.header.signature == signature,
+              loaded.header.blockSize == blockSize
+        else {
+            try? FileManager.default.removeItem(at: directory)                       // wipe + restart (no migration)
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return Catalog(header: .init(signature: signature, blockSize: blockSize))
+        }
+        let vanished = loaded.files.keys.filter {                                    // drop entries whose file is gone
+            !FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        }
+        for name in vanished { _ = loaded.drop(name) }
+        return loaded
+    }
 }
