@@ -1,15 +1,25 @@
 import Foundation
+import MLX
 import MLXLMCommon
 
-/// The `KVCache`-touching half: load/save/trim via the mlx-swift-lm primitives. Plain helpers (the
+/// The `KVCache`-touching half: load/trim/save via the mlx-swift-lm primitives. Plain helpers (the
 /// store calls them on the caller's thread); kept separate so they're unit-testable in isolation.
 enum PromptCacheIO {
     enum Failure: Error { case notTrimmable, trimUnderflow }
     static let metaSignature = "mlxpc.signature"
-    
-    static func load(url: URL, matchedTokens: Int, signature: CacheSignature) -> [KVCache]? {
+
+    /// Deserialise the whole snapshot (no trim). Signature re-checked; arrays `eval`'d so the result is
+    /// materialised and detached from any lazy graph. nil on missing/corrupt/signature-mismatch.
+    static func loadFull(url: URL, signature: CacheSignature) -> [KVCache]? {
         guard let (cache, meta) = try? loadPromptCache(url: url) else { return nil }
         guard meta[metaSignature] == signature.canonical else { return nil }
+        eval(cache.flatMap { $0.state })
+        return cache
+    }
+
+    /// Trim a **private** loaded cache to `matchedTokens` in place and verify it landed. Returns the same
+    /// array, or nil if the trim under-delivers (e.g. a wrapped RotatingKVCache).
+    static func trim(_ cache: [KVCache], toMatched matchedTokens: Int) -> [KVCache]? {
         guard let loaded = cache.first?.offset, loaded >= matchedTokens else { return nil }
         let toTrim = loaded - matchedTokens
         if toTrim > 0 {
@@ -19,7 +29,7 @@ enum PromptCacheIO {
         guard cache.first?.offset == matchedTokens else { return nil }
         return cache
     }
-    
+
     @discardableResult
     static func save(prefixTokenCount: Int, liveCache: [KVCache], url: URL, signature: CacheSignature) throws -> Int {
         let snapshot = liveCache.map { $0.copy() }
