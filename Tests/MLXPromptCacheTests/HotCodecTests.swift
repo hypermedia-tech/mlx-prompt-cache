@@ -61,4 +61,22 @@ import Testing
         // RotatingKVCache is neither KVCacheSimple nor QuantizedKVCache ⇒ not hot-cacheable (stays cold).
         #expect(HotCodec.extract([RotatingKVCache(maxSize: 16)]) == nil)
     }
+    
+    @Test func roundTripPreservesNonZeroBytes() {
+        let original = Fixture.patternedCache(tokens: 8)
+        let restored = HotCodec.reconstruct(HotCodec.extract(original)!)
+        #expect(restored.first?.offset == 8)
+        #expect(statesByteEqual(restored, original))
+    }
+    
+    @Test func quantizedRoundTrips() {
+        let original = Fixture.quantizedCache(tokens: 8)
+        let blobs = HotCodec.extract(original)
+        #expect(blobs != nil)
+        #expect(blobs?.first?.className == "QuantizedKVCache")
+        let restored = HotCodec.reconstruct(blobs!)
+        #expect(restored.first is QuantizedKVCache)
+        #expect(restored.first?.offset == original.first?.offset)
+        #expect(statesByteEqual(restored, original))
+    }
 }
