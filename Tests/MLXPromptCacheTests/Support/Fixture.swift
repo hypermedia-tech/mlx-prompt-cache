@@ -36,3 +36,29 @@ extension Fixture {
         }
     }
 }
+
+extension Fixture {
+    /// Non-zero, position-dependent `[KVCache]` so a byte-layout / stride / dtype bug can't hide
+    /// behind zeros. Each element is distinct within a layer (×coprime mod 251), and layers differ.
+    static func patternedCache(tokens: Int, layers: Int = 2, kvHeads: Int = 2, headDim: Int = 8) -> [KVCache] {
+        (0..<layers).map { layer in
+            let count = kvHeads * tokens * headDim
+            func pattern(_ mult: Int) -> MLXArray {
+                let vals = (0..<count).map { Float(($0 * mult + layer) % 251) }   // ≤ 250 ⇒ bf16-exact
+                return MLXArray(vals).reshaped([1, kvHeads, tokens, headDim]).asType(.bfloat16)
+            }
+            let c = KVCacheSimple()
+            _ = c.update(keys: pattern(7 + 2 * layer), values: pattern(13 + 2 * layer))
+            return c
+        }
+    }
+}
+
+extension Fixture{
+    /// A real `QuantizedKVCache` with no model: prefill a simple cache, then `toQuantized`.
+    static func quantizedCache(tokens: Int, layers: Int = 2, kvHeads: Int = 2, headDim: Int = 64, groupSize: Int = 64, bits: Int = 4) -> [KVCache] {
+        patternedCache(tokens: tokens, layers: layers, kvHeads: kvHeads, headDim: headDim).map {
+            ($0 as! KVCacheSimple).toQuantized(groupSize: groupSize, bits: bits)
+        }
+    }
+}
