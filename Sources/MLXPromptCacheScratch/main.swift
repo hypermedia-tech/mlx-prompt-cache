@@ -29,10 +29,12 @@ let prefixTokens = Array(fullTokens.prefix(prefixLen))
 print("tokens — full: \(fullTokens.count), cached prefix: \(prefixLen) (\(prefixLen / blockSize) blocks), suffix: \(fullTokens.count - prefixLen)")
 
 let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxpc-itest-\(UUID().uuidString)")
-let signature = CacheSignature(modelId: modelID, kvDType: "bf16", kvBits: nil, buildVersion: "itest-1")
+// let signature = CacheSignature(modelId: modelID, kvDType: "bf16", kvBits: nil, buildVersion: "itest-1")
+let signature = CacheSignature(modelId: modelID, kvDType: "bf16", kvBits: 4, buildVersion: "itest-quant-1")
 let store = try PromptCacheStore(directory: dir, budgetBytes: 8_000_000_000, signature: signature,
                                  blockSize: blockSize, hotBudgetBytes: 8_000_000_000)   // RAM hot tier on
-let params = GenerateParameters(maxTokens: 48, temperature: 0)   // greedy ⇒ deterministic ⇒ cold output must == warm
+// let params = GenerateParameters(maxTokens: 48, temperature: 0)   // greedy ⇒ deterministic ⇒ cold output must == warm
+let params = GenerateParameters(maxTokens: 48, kvBits: 4, kvGroupSize: 64, temperature: 0)
 
 struct RunResult: Sendable { var text = ""; var promptTime = 0.0; var prefilled = 0; var loadMs = 0.0 }
 
