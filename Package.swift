@@ -50,6 +50,7 @@ let package = Package(
             dependencies: [
                 "MLXPromptCache",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
             ]
         ),
