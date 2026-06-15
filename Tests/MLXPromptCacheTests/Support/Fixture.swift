@@ -62,3 +62,20 @@ extension Fixture{
         }
     }
 }
+
+extension Fixture {
+    /// A hybrid `[KVCache]`: a non-sliceable `MambaCache` FIRST (offset 0 — the exact layout that made
+    /// `cache.first?.offset` return 0 and throw `trimUnderflow`), then a sliceable `KVCacheSimple`
+    /// prefilled to `slice` tokens.
+    static func hybridCache(slice: Int, kvHeads: Int = 2, headDim: Int = 8) -> [KVCache] {
+        let attn = KVCacheSimple()
+        _ = attn.update(
+            keys: MLXArray.zeros([1, kvHeads, slice, headDim], dtype: .bfloat16),
+            values: MLXArray.zeros([1, kvHeads, slice, headDim], dtype: .bfloat16)
+        )
+        return [MambaCache(), attn]                       // non-sliceable layer first
+    }
+
+    /// No sliceable layer at all — a pure-SSM model.
+    static func pureSSMCache() -> [KVCache] { [MambaCache()] }
+}
