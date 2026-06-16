@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & unit tests
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          # Pin to a known-good Xcode (mirrors Tanuki's headless action); bump deliberately.
+          XCODE_PATH=/Applications/Xcode_26.4.1.app
+          if [ ! -d "$XCODE_PATH" ]; then
+            echo "::warning::$XCODE_PATH not found; falling back to latest installed Xcode 26"
+            XCODE_PATH=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)
+          fi
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          xcodebuild -version
+          swift --version
+
+      # MLX compiles Metal kernels; the toolchain component is needed even to build.
+      - name: Download Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # Unit tests only. The end-to-end harness (MLXPromptCacheScratch) is NOT run here —
+      # it downloads models and needs a Metal GPU that hosted runners don't provide; it's
+      # run locally before contributing (see README → Contributing).
+      - name: Run unit tests
+        run: swift test

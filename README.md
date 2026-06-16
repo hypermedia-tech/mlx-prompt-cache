@@ -2,6 +2,7 @@
 
 **Persistent prefix KV-cache for [mlx-swift](https://github.com/ml-explore/mlx-swift). Run the same context through many prompts and pay the prefill cost once — across a RAM hot tier and an SSD cold tier, even after a restart.**
 
+![CI](https://github.com/hypermedia-tech/mlx-prompt-cache/actions/workflows/ci.yml/badge.svg)
 ![Swift Package Manager](https://img.shields.io/badge/SPM-compatible-brightgreen.svg)
 ![Swift](https://img.shields.io/badge/Swift-6.3-orange.svg)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%2026%20·%20iOS%2026%20·%20tvOS%2026%20·%20visionOS%2026-blue.svg)
@@ -143,6 +144,17 @@ Reuse must never change what the model produces. The integration harness verifie
 - **Hot tier serves full-prefix matches.** A repeat query over the same recorded context is served from RAM; a *partial* cross-prompt match (sharing only a leading run of a longer snapshot) is served from disk. A hot hit reconstructs a fresh private cache from the resident bytes.
 - **Snapshots are large.** KV-cache for a long prefix can be hundreds of MB; both budgets are in bytes — size them accordingly. The RAM tier holds the same bytes the snapshot occupies on disk.
 - **Sliding-window (rotating) caches are cold-only.** Models whose cache isn't uniformly trimmable (e.g. some sliding-window attention) fall back to a clean miss rather than incorrect reuse.
+
+## Contributing
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the package and runs the **unit tests** on every push and pull request. It deliberately does **not** run the end-to-end integration harness: that downloads real models (gigabytes) and needs a Metal GPU, which GitHub's hosted runners don't provide.
+
+So **before opening a PR, run the harness locally** — it asserts reuse is lossless (`cold == warm == hot`) and prints the speedup across model sizes:
+
+```sh
+swift test                       # unit tests — same as CI
+swift run MLXPromptCacheScratch  # full integration + benchmark — needs models + a GPU; local only
+```
 
 ## Acknowledgements
 
