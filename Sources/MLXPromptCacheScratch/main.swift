@@ -7,114 +7,128 @@ import HuggingFace
 import Tokenizers
 import MLXPromptCache
 
-let modelID = "mlx-community/Qwen3-1.7B-4bit"
+// ───────────────────────── config ─────────────────────────
+
 let blockSize = 256
+let sizes = [2048, 8192, 16384, 24576]                 // cached-document token counts (block-aligned; within Qwen3's 32k)
 
-print("Loading \(modelID) …")
-let mc = try await LLMModelFactory.shared.loadContainer(
-    from: #hubDownloader(),                       // default HubClient — uses your HF cache, downloads if missing
-    using: #huggingFaceTokenizerLoader(),
-    configuration: ModelConfiguration(id: modelID)
-)
+struct ModelSpec { let id: String; let testHot: Bool }
+let models = [
+    ModelSpec(id: "mlx-community/Qwen3-1.7B-4bit",          testHot: true),    // attention → cold / disk / RAM
+    ModelSpec(id: "lmstudio-community/Qwen3.5-9B-MLX-4bit", testHot: false),   // hybrid → cold / disk only (RAM tier is attention-only)
+]
+let question = "\n\nQuestion: In one sentence, what is the single most suspicious behaviour in this log?\nAnswer:"
 
-// A long, stable "document" + a short question. The document is the reusable prefix.
-let document = String(
-    repeating: "Cyber threat report: an unusual outbound connection was seen from host 10.2.4.18 to a known C2 endpoint over port 443; the process tree shows powershell spawning a child that beacons every 60 seconds. ",
-    count: 40)
-let question = "\n\nQuestion: In one sentence, what is the suspicious behaviour?\nAnswer:"
+// ───────────────────────── helpers ─────────────────────────
 
-let fullTokens = await mc.encode(document + question)
-let prefixLen = max(blockSize, (fullTokens.count - 64) / blockSize * blockSize)   // block-aligned; leave a suffix
-let prefixTokens = Array(fullTokens.prefix(prefixLen))
-print("tokens — full: \(fullTokens.count), cached prefix: \(prefixLen) (\(prefixLen / blockSize) blocks), suffix: \(fullTokens.count - prefixLen)")
+func pad2(_ n: Int) -> String { n < 10 ? "0\(n)" : "\(n)" }
 
-let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxpc-itest-\(UUID().uuidString)")
-// let signature = CacheSignature(modelId: modelID, kvDType: "bf16", kvBits: nil, buildVersion: "itest-1")
-let signature = CacheSignature(modelId: modelID, kvDType: "bf16", kvBits: 4, buildVersion: "itest-quant-1")
-let store = try PromptCacheStore(directory: dir, budgetBytes: 8_000_000_000, signature: signature,
-                                 blockSize: blockSize, hotBudgetBytes: 8_000_000_000)   // RAM hot tier on
-// let params = GenerateParameters(maxTokens: 48, temperature: 0)   // greedy ⇒ deterministic ⇒ cold output must == warm
-let params = GenerateParameters(maxTokens: 48, kvBits: 4, kvGroupSize: 64, temperature: 0)
+/// One deterministic, varied synthetic cyber-log line (no randomness → runs are comparable).
+func logLine(_ i: Int) -> String {
+    func oct(_ n: Int) -> Int { (n % 254) + 1 }
+    let ports = [22, 80, 443, 445, 3389, 8080, 53, 25]
+    let procs = ["powershell.exe", "cmd.exe", "svchost.exe", "rundll32.exe", "wscript.exe", "mshta.exe"]
+    return "[2026-06-16T\(pad2((i / 3600) % 24)):\(pad2((i / 60) % 60)):\(pad2(i % 60))Z] "
+        + "host=10.\(oct(i)).\(oct(i * 7)).\(oct(i * 13)) pid=\(1000 + (i * 131) % 60000) "
+        + "proc=\(procs[(i * 5) % procs.count]) dst_port=\(ports[(i * 3) % ports.count]) "
+        + "bytes_out=\((i * 977) % 1_000_000) beacon_s=\(30 + (i * 17) % 600) verdict=review\n"
+}
 
-struct RunResult: Sendable { var text = ""; var promptTime = 0.0; var prefilled = 0; var loadMs = 0.0 }
+func ms(_ x: Double) -> String { String(format: "%.0f ms", x) }
+func col(_ s: String, _ w: Int) -> String { s.count >= w ? s : s + String(repeating: " ", count: w - s.count) }
 
-func oneRun(reuse: Bool) async throws -> RunResult {
+func deleteSnapshots(_ dir: URL) -> Int {
+    let snaps = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?
+        .filter { $0.pathExtension == "safetensors" } ?? []
+    for f in snaps { try? FileManager.default.removeItem(at: f) }
+    return snaps.count
+}
+
+struct RunResult: Sendable { var text = ""; var prepareMs = 0.0; var suffixStart = 0; var outcome = "" }
+struct Row { let size: Int; let cold: Double; let warm: Double; let hot: Double?; let ok: Bool }
+
+/// One run through the real coordinator path: time `prepare` (the cache's contribution), then generate the
+/// suffix. `prepare` on a miss = prefill + save (first-run cost); on a hit = disk- or RAM-load.
+func measure(mc: ModelContainer, coordinator: PromptCacheCoordinator,
+             prompt: [Int], params: GenerateParameters) async throws -> RunResult {
     try await mc.perform { context in
-        var out = RunResult()
-        var inputTokens = fullTokens
-        let cache: [KVCache]
-        if reuse {
-            let t0 = Date()
-            let reused = store.reuse(forTokens: fullTokens)
-            out.loadMs = Date().timeIntervalSince(t0) * 1000
-            if let reused {
-                inputTokens = Array(fullTokens[reused.matchedTokens...])
-                cache = reused.cache
-                print("  reuse HIT: loaded \(reused.matchedTokens) tokens in \(String(format: "%.1f", out.loadMs)) ms; prefilling \(inputTokens.count)")
-            } else {
-                cache = makePromptCache(model: context.model, parameters: params)
-                print("  reuse MISS")
-            }
-        } else {
-            cache = makePromptCache(model: context.model, parameters: params)
-        }
+        var r = RunResult()
+        let t0 = Date()
+        let prepared = coordinator.prepare(promptTokens: prompt, model: context.model, parameters: params)
+        r.prepareMs = Date().timeIntervalSince(t0) * 1000
+        r.suffixStart = prepared.suffixStart
+        r.outcome = "\(prepared.outcome)"
+        let genTokens = prepared.suffixStart > 0 ? Array(prompt[prepared.suffixStart...]) : prompt
         let stream = try MLXLMCommon.generate(
-            input: LMInput(tokens: MLXArray(inputTokens)), cache: cache, parameters: params, context: context)
-        for await g in stream {
-            switch g {
-            case .chunk(let s): out.text += s
-            case .info(let i): out.promptTime = i.promptTime; out.prefilled = i.promptTokenCount
-            case .toolCall: break
-            }
-        }
-        if !reuse { try store.record(prefixTokens: prefixTokens, cache: cache) }
-        return out
+            input: LMInput(tokens: MLXArray(genTokens)), cache: prepared.cache, parameters: params, context: context)
+        for await g in stream { if case .chunk(let s) = g { r.text += s } }
+        return r
     }
 }
 
-// Warm up Metal/model so the cold timing isn't inflated by one-time init (doesn't touch the store).
-_ = try await mc.perform { context -> Int in
-    let s = try MLXLMCommon.generate(
-        input: LMInput(tokens: MLXArray(Array(fullTokens.prefix(8)))),
-        cache: makePromptCache(model: context.model, parameters: params),
-        parameters: GenerateParameters(maxTokens: 1, temperature: 0), context: context)
-    for await _ in s {}
-    return 0
+// ───────────────────────── run ─────────────────────────
+
+for model in models {
+    print("\n=================== \(model.id) ===================")
+    print("Loading …")
+    let mc = try await LLMModelFactory.shared.loadContainer(
+        from: #hubDownloader(),
+        using: #huggingFaceTokenizerLoader(),
+        configuration: ModelConfiguration(id: model.id))
+
+    let params = GenerateParameters(maxTokens: 48, temperature: 0)   // greedy ⇒ deterministic ⇒ cold == warm == hot
+    let sig = CacheSignature(modelId: model.id, kvDType: "bf16", kvBits: nil, buildVersion: "sweep-1")
+
+    // Build one corpus big enough for the largest size; tokenise once and slice per size.
+    let corpus = (0 ..< 1400).map(logLine).joined()
+    let corpusTokens = await mc.encode(corpus)
+    let qTokens = await mc.encode(question)
+    print("corpus: \(corpusTokens.count) tokens available · question: \(qTokens.count) tokens")
+    guard corpusTokens.count >= (sizes.max() ?? 0) else {
+        print("⚠️ corpus too small (\(corpusTokens.count) < \(sizes.max()!)) — raise the line count"); continue
+    }
+
+    // Warm up Metal/model so the first cold timing isn't inflated by one-time init.
+    _ = try await mc.perform { context -> Int in
+        let s = try MLXLMCommon.generate(
+            input: LMInput(tokens: MLXArray(Array(corpusTokens.prefix(8)))),
+            cache: makePromptCache(model: context.model, parameters: params),
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0), context: context)
+        for await _ in s {}
+        return 0
+    }
+
+    var rows: [Row] = []
+    for size in sizes {
+        let document = Array(corpusTokens.prefix(size))
+        let full = document + qTokens
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxpc-sweep-\(UUID().uuidString)")
+        let store = try PromptCacheStore(directory: dir, budgetBytes: 16_000_000_000,
+                                         signature: sig, blockSize: blockSize, hotBudgetBytes: 16_000_000_000)
+        let coordinator = PromptCacheCoordinator(store: store)
+
+        // COLD — first run: miss → capture (prefill + save). The honest first-run cost.
+        let cold = try await measure(mc: mc, coordinator: coordinator, prompt: full, params: params)
+        // WARM — disk reuse: clear RAM first so the hit comes from disk.
+        store.clearHot()
+        let warm = try await measure(mc: mc, coordinator: coordinator, prompt: full, params: params)
+        // HOT — RAM reuse: WARM already promoted into RAM; delete the on-disk file so a hit can only be RAM.
+        var hot: RunResult? = nil
+        if model.testHot {
+            let n = deleteSnapshots(dir)
+            hot = try await measure(mc: mc, coordinator: coordinator, prompt: full, params: params)
+            if n == 0 { print("  ⚠️ [\(size)] no snapshot file found to delete before HOT") }
+        }
+
+        let ok = cold.text == warm.text && (hot == nil || warm.text == hot!.text)
+        rows.append(Row(size: size, cold: cold.prepareMs, warm: warm.prepareMs, hot: hot?.prepareMs, ok: ok))
+        print("  [\(size)] cold \(ms(cold.prepareMs)) (\(cold.outcome)) · warm \(ms(warm.prepareMs)) · hot \(hot.map { ms($0.prepareMs) } ?? "n/a") · suffix \(full.count - warm.suffixStart) tok · outputs \(ok ? "✅" : "❌")")
+        store.clearHot()
+    }
+
+    print("\n  \(col("doc tokens", 11))| \(col("cold (prefill+save)", 20))| \(col("warm (disk)", 13))| \(col("hot (RAM)", 11))| \(col("cold/warm", 10))| outputs")
+    for r in rows {
+        let speed = r.warm > 0 ? String(format: "%.0f×", r.cold / r.warm) : "—"
+        print("  \(col("\(r.size)", 11))| \(col(ms(r.cold), 20))| \(col(ms(r.warm), 13))| \(col(r.hot.map(ms) ?? "n/a", 11))| \(col(speed, 10))| \(r.ok ? "✅" : "❌")")
+    }
 }
-
-print("\n— COLD (no cache; records the prefix) —")
-let cold = try await oneRun(reuse: false)
-print("  prefilled \(cold.prefilled) tokens, prompt \(String(format: "%.0f", cold.promptTime * 1000)) ms")
-
-print("\n— WARM (disk reuse; promotes the snapshot into the RAM hot tier) —")
-let warm = try await oneRun(reuse: true)
-print("  prefilled \(warm.prefilled) tokens, prompt \(String(format: "%.0f", warm.promptTime * 1000)) ms")
-
-// HOT: delete every on-disk snapshot first, so a reuse hit can ONLY come from the in-RAM bytes that the
-// WARM run promoted. A HIT here (same short suffix prefilled, not a full re-prefill) proves the hot tier
-// served it without touching disk.
-print("\n— HOT (RAM bytes; on-disk snapshots deleted first) —")
-let snaps = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?
-    .filter { $0.pathExtension == "safetensors" } ?? []
-for f in snaps { try? FileManager.default.removeItem(at: f) }
-print("  deleted \(snaps.count) on-disk snapshot file(s)")
-let hot = try await oneRun(reuse: true)
-print("  prefilled \(hot.prefilled) tokens, prompt \(String(format: "%.0f", hot.promptTime * 1000)) ms")
-
-let coldReady = cold.promptTime * 1000
-let warmReady = warm.loadMs + warm.promptTime * 1000
-let hotReady = hot.loadMs + hot.promptTime * 1000
-let outputsMatch = cold.text == warm.text && warm.text == hot.text
-let hotFromRAM = hot.prefilled == warm.prefilled   // reuse hit (short suffix), not a full re-prefill from a miss
-print("""
-
-================ RESULT ================
-outputs identical : \(outputsMatch ? "✅ YES (cold == warm == hot)" : "❌ NO")
-hot from RAM      : \(hotFromRAM ? "✅ YES — served after on-disk snapshots were deleted" : "❌ NO — fell back to full prefill")
-cold : prefill \(String(format: "%.0f", coldReady)) ms over \(cold.prefilled) tokens
-warm : load \(String(format: "%.1f", warm.loadMs)) ms + prefill \(String(format: "%.0f", warm.promptTime * 1000)) ms over \(warm.prefilled) tokens
-hot  : load \(String(format: "%.1f", hot.loadMs)) ms + prefill \(String(format: "%.0f", hot.promptTime * 1000)) ms over \(hot.prefilled) tokens
-ready : cold \(String(format: "%.0f", coldReady)) → warm \(String(format: "%.0f", warmReady)) → hot \(String(format: "%.0f", hotReady)) ms
-========================================
-""")
-if !outputsMatch { print("\nCOLD:\n\(cold.text)\n\nWARM:\n\(warm.text)\n\nHOT:\n\(hot.text)") }
