@@ -147,13 +147,13 @@ Reuse must never change what the model produces. The integration harness verifie
 
 ## Contributing
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the package and runs the **unit tests** on every push and pull request. It deliberately does **not** run the end-to-end integration harness: that downloads real models (gigabytes) and needs a Metal GPU, which GitHub's hosted runners don't provide.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) compile-checks the package — and the test code — on a clean runner for every push and pull request. It does **not** run the tests: GitHub's hosted runners have no Metal GPU, so anything that exercises MLX fails to load at runtime. The unit tests and the end-to-end harness both run **locally**.
 
-So **before opening a PR, run the harness locally** — it asserts reuse is lossless (`cold == warm == hot`) and prints the speedup across model sizes:
+So **before opening a PR, run them locally** — the harness asserts reuse is lossless (`cold == warm == hot`) and prints the speedup across model sizes:
 
 ```sh
-swift test                       # unit tests — same as CI
-swift run MLXPromptCacheScratch  # full integration + benchmark — needs models + a GPU; local only
+swift test                       # unit tests (incl. the MLX-backed ones)
+swift run MLXPromptCacheScratch  # full integration + benchmark — models + GPU
 ```
 
 ## Acknowledgements

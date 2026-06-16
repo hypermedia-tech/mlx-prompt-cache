@@ -32,8 +32,7 @@ jobs:
       - name: Download Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
 
-      # Unit tests only. The end-to-end harness (MLXPromptCacheScratch) is NOT run here —
-      # it downloads models and needs a Metal GPU that hosted runners don't provide; it's
-      # run locally before contributing (see README → Contributing).
-      - name: Run unit tests
-        run: swift test
+      # Hosted runners have no Metal GPU, so MLX can't run here — compile only (incl. the test code).
+      # The unit tests and the integration harness both run locally (see README → Contributing).
+      - name: Build (compile check)
+        run: swift build --build-tests
