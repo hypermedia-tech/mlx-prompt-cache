@@ -65,6 +65,11 @@ struct Catalog: Codable {
         return deleted
     }
 
+    /// Drop one file's entry — used by the store when a snapshot is found missing/corrupt on load
+    /// (self-heal after an out-of-band delete), so the next `record` can replace it rather than being
+    /// blocked by `planRecord` seeing the blocks "already in catalog".
+    mutating func evict(_ name: String) { _ = drop(name) }
+
     private mutating func drop(_ name: String) -> String {
         if let r = files.removeValue(forKey: name) {
             for h in r.ownedBoundaries { byHash[h] = nil }

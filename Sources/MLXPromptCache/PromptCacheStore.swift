@@ -61,7 +61,15 @@ public final class PromptCacheStore: Sendable {
         let url = directory.appendingPathComponent(hit.fileName)
         guard let full = PromptCacheIO.loadFull(url: url, signature: signature),
               let fullTokens = PromptCacheIO.tokenLength(full) else {
-            log("reuse: MISS — loadFull failed for \(hit.fileName) (missing file / corrupt / signature mismatch / no sliceable layer)")
+            // Self-heal: the catalog points at a snapshot that's gone or corrupt (e.g. deleted out-of-band
+            // while live). Evict the dead entry, rewrite the index, and drop it from the hot tier, so the
+            // next `record` re-stores it instead of being blocked by `planRecord` ("already in catalog").
+            catalog.withLock { cat in
+                cat.evict(hit.fileName)
+                Self.writeIndex(cat, to: directory.appendingPathComponent("index.json"))
+            }
+            hot.withLock { $0.drop(hit.fileName) }
+            log("reuse: MISS — \(hit.fileName) missing/corrupt; evicted dead catalog entry (will re-record)")
             return nil
         }
         log("reuse: loaded \(hit.fileName) — snapshot offset \(fullTokens)")
@@ -107,6 +115,9 @@ public final class PromptCacheStore: Sendable {
         }
         log("record: plan \(plan.fileName) — \(plan.boundaries.count) boundaries, up to \(plan.boundaries.last?.tokenCount ?? 0) tokens")
 
+        // Recreate the directory if it was deleted out-of-band (e.g. a live `rm -rf`) — otherwise
+        // `savePromptCache` fails to open the file. Completes the self-heal alongside the catalog evict.
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent(plan.fileName)
         let bytes: Int
         do {
