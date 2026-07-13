@@ -114,4 +114,59 @@ import Testing
         try deleteSnapshots(in: dir)
         #expect(store.reuse(forTokens: [1,2,3,4,9,9,9,9]) == nil) // proves it wasn't in RAM
     }
+
+    // MARK: - peek (K0 idempotence probe)
+
+    @Test func peekOnEmptyStoreIsZero() throws {
+        let store = try makeStore(Fixture.tempDir())
+        #expect(store.peek(forTokens: Fixture.tokens(8)) == 0)
+    }
+
+    @Test func peekReportsRecordedAlignedLength() throws {
+        let store = try makeStore(Fixture.tempDir())                    // blockSize 4
+        try store.record(prefixTokens: Fixture.tokens(10), cache: Fixture.syntheticCache(tokens: 10))
+        // 10 tokens at blockSize 4 → 2 full blocks stored → the probe reports 8, not 10.
+        #expect(store.peek(forTokens: Fixture.tokens(10)) == 8)
+    }
+
+    @Test func peekAgreesWithReuseOnPartialMatch() throws {
+        let store = try makeStore(Fixture.tempDir())
+        try store.record(prefixTokens: [1, 2, 3, 4, 5, 6, 7, 8], cache: Fixture.syntheticCache(tokens: 8))
+        let query = [1, 2, 3, 4, 9, 9, 9, 9]
+        #expect(store.peek(forTokens: query) == 4)
+        #expect(store.peek(forTokens: query) == store.reuse(forTokens: query)?.matchedTokens)
+    }
+
+    @Test func peekIsZeroAfterSignatureReset() throws {
+        let dir = Fixture.tempDir()
+        do {
+            let store = try makeStore(dir)
+            try store.record(prefixTokens: Fixture.tokens(8), cache: Fixture.syntheticCache(tokens: 8))
+        }
+        let other = CacheSignature(modelId: "other-model", kvDType: "bf16", kvBits: nil, buildVersion: "t1")
+        let reopened = try makeStore(dir, signature: other)             // loadOrReset wipes
+        #expect(reopened.peek(forTokens: Fixture.tokens(8)) == 0)
+    }
+
+    /// Integration guard that `peek` is wired to `Catalog.probe`, not `lookup`: probing an entry many
+    /// times must NOT freshen its LRU stamp, so an over-budget record still evicts the true oldest.
+    /// If `peek` regresses to the mutating `lookup`, the probed entry (A) would look hottest and B
+    /// would be evicted instead — flipping both expectations below.
+    @Test func peekDoesNotFreshenLRU() throws {
+        let store = try makeStore(Fixture.tempDir(), budget: 1_200_000)  // holds two ~512 KB snapshots, not three
+        func big(_ seed: Int) -> [KVCache] { Fixture.syntheticCache(tokens: 8, layers: 8, kvHeads: 16, headDim: 128) }
+        try store.record(prefixTokens: Fixture.tokens(8, seed: 0),   cache: big(0))   // A: oldest
+        try store.record(prefixTokens: Fixture.tokens(8, seed: 100), cache: big(100)) // B: newer
+        for _ in 0..<5 { _ = store.peek(forTokens: Fixture.tokens(8, seed: 0)) }       // probe A hard
+        try store.record(prefixTokens: Fixture.tokens(8, seed: 200), cache: big(200)) // C: pushes over budget
+        #expect(store.reuse(forTokens: Fixture.tokens(8, seed: 0)) == nil)             // A still evicted (LRU)
+        #expect(store.reuse(forTokens: Fixture.tokens(8, seed: 100)) != nil)           // B survives
+    }
+
+    @Test func canonicalRenderingIsStable() {
+        // The string is a durable provenance value in CyberBench (APRV-005) — format-pinned.
+        #expect(Fixture.signature.canonical == "test-model|bf16|-|t1")
+        #expect(CacheSignature(modelId: "m", kvDType: "float16", kvBits: 8, buildVersion: "2").canonical
+                == "m|float16|8|2")
+    }
 }

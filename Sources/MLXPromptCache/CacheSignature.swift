@@ -14,5 +14,5 @@ public struct CacheSignature: Hashable, Sendable, Codable {
     }
     
     /// Canonical bytes folded into the block hash and stored in snapshot metadata
-    var canonical: String { "\(modelId)|\(kvDType)|\(kvBits.map(String.init) ?? "-")|\(buildVersion)" }
+    public var canonical: String { "\(modelId)|\(kvDType)|\(kvBits.map(String.init) ?? "-")|\(buildVersion)" }
 }

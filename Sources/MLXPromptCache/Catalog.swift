@@ -36,6 +36,21 @@ struct Catalog: Codable {
         return Plan(fileName: name, boundaries: bounds)
     }
     
+    /// Longest matched prefix WITHOUT touching LRU state. `lookup` is the mutating twin — it
+    /// bumps `clock`/`lastAccess` because its caller (`reuse`) is about to use the snapshot,
+    /// so the touch is honest recency. A background probe (`peek` — K1 warm idempotence, K2
+    /// custodian sweeps) must not freshen entries it merely checks, or probe frequency would
+    /// masquerade as heat and rot the eviction order.
+    func probe(_ hashes: [BlockHash]) -> Hit? {
+        var deepest: Boundary?
+        for h in hashes {
+            guard let b = byHash[h.hex] else { break }
+            deepest = b
+        }
+        guard let hit = deepest else { return nil }
+        return Hit(fileName: hit.fileName, matchedTokens: hit.tokenCount)
+    }
+    
     /// Install a written snapshot, enforce budget. Returns fileNames whose files the caller must delete.
     mutating func commit(_ plan: Plan, byteSize: Int, budgetBytes: Int) -> [String] {
         clock += 1

@@ -11,7 +11,7 @@ public struct Reused { public let cache: [KVCache]; public let matchedTokens: In
 /// catalog and the hot tier are `Sendable` value types behind a `Mutex`. Design:
 /// `mlx-prompt-cache-module-brief.md` + `-phase2-hot-tier.md`.
 public final class PromptCacheStore: Sendable {
-    let blockSize: Int
+    public let blockSize: Int
     private let directory: URL
     private let budgetBytes: Int
     private let signature: CacheSignature
@@ -103,6 +103,22 @@ public final class PromptCacheStore: Sendable {
 
     /// Drop all residents (model swap / admin clear). Disk is untouched.
     public func clearHot() { hot.withLock { $0.clear() } }
+    
+    /// Matched token count for the longest cached prefix of `tokens` — catalog-only: no snapshot IO,
+    /// no MLX, no GPU, and NO LRU touch (see `Catalog.probe`). The idempotence probe for background
+    /// warming: `peek(...) >= alignedLength` means "already warm, skip".
+    ///
+    /// Honesty note: the probe trusts the in-memory catalog. A snapshot deleted out-of-band while the
+    /// store is live can make `peek` over-report until the next `reuse` self-heals the dead entry.
+    /// Consequence: a warm pass skips a file it should have warmed, and the next ask pays one cold
+    /// prefill — never a wrong answer.
+    public func peek(forTokens tokens: [Int]) -> Int {
+        let hashes = BlockHasher.boundaries(for: tokens, blockSize: blockSize, signature: signature)
+        guard !hashes.isEmpty else { return 0 }
+        let matched = catalog.withLock { $0.probe(hashes)?.matchedTokens ?? 0 }
+        log("peek: \(tokens.count) tokens → \(hashes.count) full \(blockSize)-blocks; matched \(matched)")
+        return matched
+    }
 
     private func write(prefixTokens: [Int], cache: [KVCache], warmHot: Bool) throws {
         let hashes = BlockHasher.boundaries(for: prefixTokens, blockSize: blockSize, signature: signature)

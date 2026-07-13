@@ -82,4 +82,43 @@ import Testing
         #expect(restored.lookup(hashes(toks))?.matchedTokens == 8)
         #expect(restored.totalBytes == cat.totalBytes)
     }
+
+    // MARK: - probe (read-only twin of lookup, K0)
+
+    @Test func probeDoesNotBumpClockOrLastAccess() {
+        var cat = emptyCatalog()
+        let toks = Fixture.tokens(8)
+        let plan = cat.planRecord(hashes(toks), blockSize: bs)!
+        _ = cat.commit(plan, byteSize: 100, budgetBytes: 1_000)
+
+        let clockBefore = cat.clock
+        let accessBefore = cat.files[plan.fileName]!.lastAccess
+        #expect(cat.probe(hashes(toks))?.matchedTokens == 8)            // read-only twin
+        #expect(cat.clock == clockBefore)
+        #expect(cat.files[plan.fileName]!.lastAccess == accessBefore)
+
+        _ = cat.lookup(hashes(toks))                                    // the mutating twin still touches
+        #expect(cat.clock == clockBefore + 1)
+        #expect(cat.files[plan.fileName]!.lastAccess == clockBefore + 1)
+    }
+
+    @Test func probedEntryStillEvictsFirst() {
+        // The LRU-corruption scenario the probe exists to avoid: A is oldest, B newer; probing A
+        // repeatedly must NOT save it — the next over-budget commit still evicts A.
+        var cat = emptyCatalog()
+        let a = hashes(Fixture.tokens(8, seed: 0))
+        let b = hashes(Fixture.tokens(8, seed: 100))
+        let c = hashes(Fixture.tokens(8, seed: 200))
+
+        let planA = cat.planRecord(a, blockSize: bs)!
+        _ = cat.commit(planA, byteSize: 100, budgetBytes: 1_000)        // A: lastAccess 1
+        _ = cat.commit(cat.planRecord(b, blockSize: bs)!, byteSize: 100, budgetBytes: 1_000)  // B: 2
+
+        _ = cat.probe(a); _ = cat.probe(a); _ = cat.probe(a)            // probe A hard
+
+        // Committing C at a 250-byte budget (3 × 100 on disk) must evict exactly the LRU entry —
+        // and that is still A, because probes left its lastAccess alone.
+        let evicted = cat.commit(cat.planRecord(c, blockSize: bs)!, byteSize: 100, budgetBytes: 250)
+        #expect(evicted == [planA.fileName])
+    }
 }
