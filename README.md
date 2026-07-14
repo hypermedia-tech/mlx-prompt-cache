@@ -163,15 +163,6 @@ Cold (fresh prefill) → warm (reused prefix), at the smallest and largest conte
 | `Qwen3.5-9B` | ~800 tok/s | 57 → 34 KiB ⬇ | ~0.8 GiB |
 | `Qwen3-1.7B` | ~2,800 tok/s | 112 KiB · flat | ~2.6 GiB |
 
-```mermaid
-xychart-beta
-    title "Qwen3.6-35B-A3B — time to first token (bars = cold prefill, line = warm reuse)"
-    x-axis ["2k context", "24k context"]
-    y-axis "TTFT (seconds)" 0 --> 20
-    bar [1.88, 19.4]
-    line [0.068, 0.112]
-```
-
 **How to read this:**
 
 - 🟢 **Warm TTFT is small and roughly flat regardless of context** — only the new suffix is prefilled, so a repeat question over a huge document answers about as fast as one over a small document.
