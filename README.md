@@ -122,13 +122,13 @@ A complete, runnable end-to-end example — load a model, cold vs. warm, verify 
 
 | Symbol | Purpose |
 | --- | --- |
-| `PromptCacheStore(
+| ```PromptCacheStore(
 |    directory:
 |    budgetBytes:
 |    signature:
 |    blockSize:
 |    hotBudgetBytes:
-| )` | Open/create a store. `hotBudgetBytes: 0` (default) = SSD only; `> 0` enables the RAM hot tier. |
+| )``` | Open/create a store. `hotBudgetBytes: 0` (default) = SSD only; `> 0` enables the RAM hot tier. |
 | `store.reuse(forTokens:) -> Reused?` | Longest cached prefix, served from RAM if resident else disk, trimmed to the match. |
 | `store.record(prefixTokens:cache:)` | Snapshot a freshly-prefilled prefix for future reuse (disk; warms RAM on the next reuse). |
 | `store.preload(prefixTokens:cache:)` | Like `record`, but also pre-warms the RAM tier now — for launch-time warming. |
