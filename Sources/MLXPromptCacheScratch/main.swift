@@ -126,6 +126,73 @@ for model in models {
         store.clearHot()
     }
 
+    // ── K2a gate: paused→resumed warm must be byte-identical to an uninterrupted warm (and to cold) ──
+    do {
+        let doc = Array(corpusTokens.prefix(2048))
+        let full = doc + qTokens
+        let gateParams = GenerateParameters(maxTokens: 48, temperature: 0)   // greedy ⇒ deterministic
+
+        func generateOverWarmed(_ store: PromptCacheStore) async throws -> String {
+            let coordinator = PromptCacheCoordinator(store: store)
+            return try await mc.perform { context in
+                let prepared = coordinator.prepare(promptTokens: full, model: context.model, parameters: gateParams)
+                let gen = prepared.suffixStart > 0 ? Array(full[prepared.suffixStart...]) : full
+                let stream = try MLXLMCommon.generate(
+                    input: LMInput(tokens: MLXArray(gen)), cache: prepared.cache,
+                    parameters: gateParams, context: context)
+                var t = ""; for await g in stream { if case .chunk(let s) = g { t += s } }
+                return t
+            }
+        }
+
+        func freshStore(_ tag: String) throws -> PromptCacheStore {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mlxpc-warmgate-\(tag)-\(UUID().uuidString)")
+            return try PromptCacheStore(directory: dir, budgetBytes: 16_000_000_000, signature: sig, blockSize: blockSize)
+        }
+
+        // A — pause once mid-prefill, then resume.
+        let storeA = try freshStore("A")
+        let (pausedOK, completeOK): (Bool, Bool) = await mc.perform { context in
+            let coordA = PromptCacheCoordinator(store: storeA)
+            var fired = false
+            let pauseOnce: () -> Bool = { if fired { return false }; fired = true; return true }
+            let p = coordA.warm(promptTokens: full, model: context.model, parameters: gateParams, shouldPause: pauseOnce)
+            guard case let .paused(cached) = p else { print("  ⚠️ warm did not pause: \(p)"); return (false, false) }
+            let c = coordA.warm(promptTokens: full, model: context.model, parameters: gateParams)
+            guard case let .complete(total, prefilled) = c else { print("  ⚠️ resume did not complete: \(c)"); return (true, false) }
+            print("  warm gate: paused@\(cached) → complete(total \(total), prefilled \(prefilled) = remainder)")
+            return (true, true)
+        }
+        let textA = try await generateOverWarmed(storeA)
+
+        // B — uninterrupted warm, fresh store.
+        let storeB = try freshStore("B")
+        _ = await mc.perform { context -> Int in
+            _ = PromptCacheCoordinator(store: storeB).warm(promptTokens: full, model: context.model, parameters: gateParams)
+            return 0
+        }
+        let textB = try await generateOverWarmed(storeB)
+
+        // COLD — no cache at all.
+        let textCold = try await mc.perform { context in
+            let stream = try MLXLMCommon.generate(
+                input: LMInput(tokens: MLXArray(full)),
+                cache: makePromptCache(model: context.model, parameters: gateParams),
+                parameters: gateParams, context: context)
+            var t = ""; for await g in stream { if case .chunk(let s) = g { t += s } }
+            return t
+        }
+
+        let ok = pausedOK && completeOK && textA == textB && textB == textCold
+        print("  K2a warm gate [\(model.id)]: paused-resume == uninterrupted == cold → \(ok ? "✅" : "❌")")
+        if !ok {
+            print("    A   = \(textA.prefix(80))")
+            print("    B   = \(textB.prefix(80))")
+            print("    cold= \(textCold.prefix(80))")
+        }
+    }
+
     print("\n  \(col("doc tokens", 11))| \(col("cold (prefill+save)", 20))| \(col("warm (disk)", 13))| \(col("hot (RAM)", 11))| \(col("cold/warm", 10))| outputs")
     for r in rows {
         let speed = r.warm > 0 ? String(format: "%.0f×", r.cold / r.warm) : "—"
