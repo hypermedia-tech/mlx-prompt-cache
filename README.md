@@ -120,15 +120,13 @@ A complete, runnable end-to-end example — load a model, cold vs. warm, verify 
 
 ### API surface
 
-| Symbol | Purpose |
-| --- | --- |
-| <code>PromptCacheStore(<br>&nbsp;&nbsp;directory:budgetBytes:<br>&nbsp;&nbsp;signature:blockSize:<br>&nbsp;&nbsp;hotBudgetBytes:)</code> | Open/create a store. `hotBudgetBytes: 0` (default) = SSD only; `> 0` enables the RAM hot tier. |
-| `store.reuse(forTokens:) -> Reused?` | Longest cached prefix, served from RAM if resident else disk, trimmed to the match. |
-| `store.record(prefixTokens:cache:)` | Snapshot a freshly-prefilled prefix for future reuse (disk; warms RAM on the next reuse). |
-| `store.preload(prefixTokens:cache:)` | Like `record`, but also pre-warms the RAM tier now — for launch-time warming. |
-| `store.clearHot()` | Drop all RAM residents (e.g. on a model swap). Disk is untouched. |
-| `Reused { cache: [KVCache]; matchedTokens: Int }` | The recovered cache and how many leading tokens it covers. |
-| `CacheSignature(modelId:kvDType:kvBits:buildVersion:)` | Invalidation key — reuse is gated on an exact match. |
+- **`PromptCacheStore(directory:budgetBytes:signature:blockSize:hotBudgetBytes:)`** — open/create a store. `hotBudgetBytes: 0` (default) = SSD only; `> 0` enables the RAM hot tier.
+- **`store.reuse(forTokens:) -> Reused?`** — longest cached prefix, served from RAM if resident else disk, trimmed to the match.
+- **`store.record(prefixTokens:cache:)`** — snapshot a freshly-prefilled prefix for future reuse (disk; warms RAM on the next reuse).
+- **`store.preload(prefixTokens:cache:)`** — like `record`, but also pre-warms the RAM tier now, for launch-time warming.
+- **`store.clearHot()`** — drop all RAM residents (e.g. on a model swap). Disk is untouched.
+- **`Reused { cache: [KVCache]; matchedTokens: Int }`** — the recovered cache and how many leading tokens it covers.
+- **`CacheSignature(modelId:kvDType:kvBits:buildVersion:)`** — invalidation key; reuse is gated on an exact match.
 
 ### Threading
 
