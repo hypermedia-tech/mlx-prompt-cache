@@ -134,4 +134,80 @@ import Testing
         #expect(total == boundary)
         #expect(prefilled == boundary - 512)                // reused the 512 blocks the short warm recorded
     }
+
+    // MARK: - Chunked prefill reaches the boundary with a pause probe that never fires
+
+    /// blockStep params split the 512-boundary prefill into two 256-chunks. A `shouldPause` that is
+    /// present but always false must still drive both chunks to the boundary — the pause plumbing
+    /// mustn't stall an uninterrupted warm.
+    @Test func chunkedPrefillReachesBoundaryWithoutPausing() throws {
+        let (_, store, coord) = try makeCoord()
+        let tokens = Fixture.tokens(600)                    // boundary 512
+        let out = coord.warm(promptTokens: tokens, model: twoLayerModel(),
+                             parameters: blockStepParams(), shouldPause: { false })
+        guard case let .complete(cached, prefilled) = out else {
+            Issue.record("expected .complete, got \(out)"); return
+        }
+        #expect(cached == 512)
+        #expect(prefilled == 512)
+        #expect(store.peek(forTokens: tokens) == 512)
+    }
+
+    // MARK: - Repeated pauses walk the prefix forward one block at a time
+
+    /// Each paused warm lands exactly one more block (persisted), then a final un-paused warm finishes
+    /// the remainder — proving resume-from-partial composes across many interruptions, not just one.
+    @Test func repeatedPausesAdvanceBlockByBlock() throws {
+        let (_, store, coord) = try makeCoord()
+        let tokens = Fixture.tokens(2000)                   // boundary 1792
+        let params = blockStepParams()                      // 256-token chunks
+        var last = 0
+        for expected in stride(from: 256, through: 768, by: 256) {
+            let out = coord.warm(promptTokens: tokens, model: twoLayerModel(), parameters: params,
+                                 shouldPause: { true })
+            guard case let .paused(cached) = out else { Issue.record("expected .paused, got \(out)"); return }
+            #expect(cached == expected)
+            #expect(cached == last + 256)                   // one block per pause, no skips
+            #expect(store.peek(forTokens: tokens) == expected)
+            last = cached
+        }
+        let done = coord.warm(promptTokens: tokens, model: twoLayerModel(), parameters: params)
+        guard case let .complete(total, prefilled) = done else {
+            Issue.record("expected .complete, got \(done)"); return
+        }
+        #expect(total == 1792)
+        #expect(prefilled == 1792 - 768)                    // only the still-cold tail, the 768 warmed blocks reused
+    }
+
+    // MARK: - Hybrid (recurrent + attention) warms at a captured boundary
+
+    /// A hybrid model — non-sliceable `MambaCache` first, sliceable `KVCacheSimple` second — is the layout
+    /// that once threw `trimUnderflow` (`cache.first?.offset` read the Mamba layer's 0). `warm` keys token
+    /// length off the attention layer, lands the cache exactly at the boundary, and records it (a boundary
+    /// capture, the only shape a hybrid snapshot is valid in).
+    @Test func warmHybridCompletesAtBoundary() throws {
+        let (_, store, coord) = try makeCoord()
+        let model = StubModel { [MambaCache(), KVCacheSimple()] as [KVCache] }
+        let tokens = Fixture.tokens(600)                    // boundary 512
+        let out = coord.warm(promptTokens: tokens, model: model, parameters: GenerateParameters())
+        guard case let .complete(cached, prefilled) = out else {
+            Issue.record("expected .complete, got \(out)"); return
+        }
+        #expect(cached == 512)
+        #expect(prefilled == 512)
+        #expect(store.peek(forTokens: tokens) == 512)
+    }
+
+    // MARK: - Pure-SSM has no attention layer to key on
+
+    /// A pure-SSM cache (`MambaCache` only) has no sliceable layer, so `tokenLength` is nil and the prefill
+    /// can't be verified to have landed — `warm` must decline rather than record an unkeyable snapshot.
+    @Test func warmPureSSMIsUncacheable() throws {
+        let (_, store, coord) = try makeCoord()
+        let model = StubModel { [MambaCache()] as [KVCache] }
+        let tokens = Fixture.tokens(600)
+        let out = coord.warm(promptTokens: tokens, model: model, parameters: GenerateParameters())
+        guard case .uncacheable = out else { Issue.record("expected .uncacheable, got \(out)"); return }
+        #expect(store.peek(forTokens: tokens) == 0)         // nothing recorded
+    }
 }

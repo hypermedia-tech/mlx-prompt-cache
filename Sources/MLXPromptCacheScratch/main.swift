@@ -14,10 +14,12 @@ let sizes = [2048, 8192, 16384, 24576]                 // cached-document token 
 
 struct ModelSpec { let id: String; let testHot: Bool }
 let models = [
+    ModelSpec(id: "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",    testHot: false),   // PRODUCTION deep tenant (hybrid Mamba) — the numbers §0 wants
     ModelSpec(id: "mlx-community/Qwen3-1.7B-4bit",          testHot: true),    // attention → cold / disk / RAM
     ModelSpec(id: "lmstudio-community/Qwen3.5-9B-MLX-4bit", testHot: false),   // hybrid → cold / disk only (RAM tier is attention-only)
 ]
 let question = "\n\nQuestion: In one sentence, what is the single most suspicious behaviour in this log?\nAnswer:"
+let questionB = "\n\nQuestion: Name the single host that appears most often in this log.\nAnswer:"
 
 // ───────────────────────── helpers ─────────────────────────
 
@@ -44,24 +46,59 @@ func deleteSnapshots(_ dir: URL) -> Int {
     return snaps.count
 }
 
-struct RunResult: Sendable { var text = ""; var prepareMs = 0.0; var suffixStart = 0; var outcome = "" }
-struct Row { let size: Int; let cold: Double; let warm: Double; let hot: Double?; let ok: Bool }
+/// Bytes of the recorded snapshot(s) in a store directory — the on-disk cost of a warmed prefix.
+func snapshotBytes(in dir: URL) -> Int64 {
+    let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+    return files.filter { $0.pathExtension == "safetensors" }.reduce(Int64(0)) {
+        $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+    }
+}
 
-/// One run through the real coordinator path: time `prepare` (the cache's contribution), then generate the
-/// suffix. `prepare` on a miss = prefill + save (first-run cost); on a hit = disk- or RAM-load.
+struct RunResult: Sendable {
+    var text = ""
+    var prepareMs = 0.0        // cache contribution: cold = prefill+record, warm/hot = load
+    var ttftMs = 0.0           // prompt-ready → first generated token (the felt latency §0 measures)
+    var genTokPerSec = 0.0     // decode throughput AFTER the first token (cache must NOT move this)
+    var boundary = 0           // captured block-aligned prefix (cold); 0 otherwise
+    var matched = 0            // tokens served from cache (hit); 0 on a cold capture
+    var suffixStart = 0
+    var outcome = ""
+}
+struct Row {
+    let size: Int
+    let coldTtft, warmTtft, newQTtft: Double
+    let hotTtft: Double?
+    let prefillTokPerSec, kibPerTok, coldGenTps, warmGenTps: Double
+    let ok: Bool
+}
+
+/// One run through the real coordinator path: time `prepare` (the cache's contribution) AND the felt TTFT
+/// (prompt-ready → first token), then generate the suffix, reading decode throughput from `.info`.
+/// `prepare` on a miss = prefill + save (first-run cost); on a hit = disk- or RAM-load.
 func measure(mc: ModelContainer, coordinator: PromptCacheCoordinator,
              prompt: [Int], params: GenerateParameters) async throws -> RunResult {
     try await mc.perform { context in
         var r = RunResult()
-        let t0 = Date()
+        let t0 = Date()                                            // prompt-ready (tokens precomputed)
         let prepared = coordinator.prepare(promptTokens: prompt, model: context.model, parameters: params)
         r.prepareMs = Date().timeIntervalSince(t0) * 1000
         r.suffixStart = prepared.suffixStart
         r.outcome = "\(prepared.outcome)"
+        if case let .hit(m)      = prepared.outcome { r.matched = m }
+        if case let .captured(b) = prepared.outcome { r.boundary = b }
         let genTokens = prepared.suffixStart > 0 ? Array(prompt[prepared.suffixStart...]) : prompt
         let stream = try MLXLMCommon.generate(
             input: LMInput(tokens: MLXArray(genTokens)), cache: prepared.cache, parameters: params, context: context)
-        for await g in stream { if case .chunk(let s) = g { r.text += s } }
+        var firstAt: Date?
+        for await g in stream {
+            if case .chunk(let s) = g {
+                if firstAt == nil { firstAt = Date(); r.ttftMs = firstAt!.timeIntervalSince(t0) * 1000 }
+                r.text += s
+            }
+            if case .info(let info) = g {                          // same fields the applied engine reads
+                r.genTokPerSec = info.generateTime > 0 ? Double(info.generationTokenCount) / info.generateTime : 0
+            }
+        }
         return r
     }
 }
@@ -83,6 +120,7 @@ for model in models {
     let corpus = (0 ..< 1400).map(logLine).joined()
     let corpusTokens = await mc.encode(corpus)
     let qTokens = await mc.encode(question)
+    let qbTokens = await mc.encode(questionB)
     print("corpus: \(corpusTokens.count) tokens available · question: \(qTokens.count) tokens")
     guard corpusTokens.count >= (sizes.max() ?? 0) else {
         print("⚠️ corpus too small (\(corpusTokens.count) < \(sizes.max()!)) — raise the line count"); continue
@@ -100,29 +138,37 @@ for model in models {
 
     var rows: [Row] = []
     for size in sizes {
-        let document = Array(corpusTokens.prefix(size))
-        let full = document + qTokens
+        let document = Array(corpusTokens.prefix(size))     // block-aligned (sizes are 256-multiples)
+        let fullA = document + qTokens
+        let fullB = document + qbTokens
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxpc-sweep-\(UUID().uuidString)")
         let store = try PromptCacheStore(directory: dir, budgetBytes: 16_000_000_000,
                                          signature: sig, blockSize: blockSize, hotBudgetBytes: 16_000_000_000)
         let coordinator = PromptCacheCoordinator(store: store)
 
-        // COLD — first run: miss → capture (prefill + save). The honest first-run cost.
-        let cold = try await measure(mc: mc, coordinator: coordinator, prompt: full, params: params)
-        // WARM — disk reuse: clear RAM first so the hit comes from disk.
+        let cold  = try await measure(mc: mc, coordinator: coordinator, prompt: fullA, params: params)  // miss → capture
+        let bytes = snapshotBytes(in: dir)                                                              // the recorded prefix
         store.clearHot()
-        let warm = try await measure(mc: mc, coordinator: coordinator, prompt: full, params: params)
-        // HOT — RAM reuse: WARM already promoted into RAM; delete the on-disk file so a hit can only be RAM.
+        let warm  = try await measure(mc: mc, coordinator: coordinator, prompt: fullA, params: params)  // disk, same Q
+        let newQ  = try await measure(mc: mc, coordinator: coordinator, prompt: fullB, params: params)  // disk, DIFFERENT Q
         var hot: RunResult? = nil
         if model.testHot {
             let n = deleteSnapshots(dir)
-            hot = try await measure(mc: mc, coordinator: coordinator, prompt: full, params: params)
-            if n == 0 { print("  ⚠️ [\(size)] no snapshot file found to delete before HOT") }
+            hot = try await measure(mc: mc, coordinator: coordinator, prompt: fullA, params: params)     // RAM only
+            if n == 0 { print("  ⚠️ [\(size)] no snapshot file to delete before HOT") }
         }
 
-        let ok = cold.text == warm.text && (hot == nil || warm.text == hot!.text)
-        rows.append(Row(size: size, cold: cold.prepareMs, warm: warm.prepareMs, hot: hot?.prepareMs, ok: ok))
-        print("  [\(size)] cold \(ms(cold.prepareMs)) (\(cold.outcome)) · warm \(ms(warm.prepareMs)) · hot \(hot.map { ms($0.prepareMs) } ?? "n/a") · suffix \(full.count - warm.suffixStart) tok · outputs \(ok ? "✅" : "❌")")
+        let prefillTokPerSec = cold.prepareMs > 0 ? Double(cold.boundary) / (cold.prepareMs / 1000) : 0
+        let kibPerTok        = cold.boundary  > 0 ? Double(bytes) / 1024 / Double(cold.boundary) : 0
+        // Correctness: same-Q reuse byte-identical; the different-Q ask still hit the doc blocks; hot matches warm.
+        let ok = cold.text == warm.text
+            && newQ.matched > 0
+            && (hot == nil || warm.text == hot!.text)
+        rows.append(Row(size: size,
+                        coldTtft: cold.ttftMs, warmTtft: warm.ttftMs, newQTtft: newQ.ttftMs, hotTtft: hot?.ttftMs,
+                        prefillTokPerSec: prefillTokPerSec, kibPerTok: kibPerTok,
+                        coldGenTps: cold.genTokPerSec, warmGenTps: warm.genTokPerSec, ok: ok))
+        print("  [\(size)] TTFT cold \(ms(cold.ttftMs)) → warm \(ms(warm.ttftMs)) (\(String(format: "%.1f×", cold.ttftMs / max(warm.ttftMs, 0.001)))) · new-Q \(ms(newQ.ttftMs)) (matched \(newQ.matched)) · prefill \(String(format: "%.0f", prefillTokPerSec)) tok/s · \(String(format: "%.0f", kibPerTok)) KiB/tok · gen \(String(format: "%.0f", warm.genTokPerSec)) tok/s · \(ok ? "✅" : "❌")")
         store.clearHot()
     }
 
@@ -193,9 +239,8 @@ for model in models {
         }
     }
 
-    print("\n  \(col("doc tokens", 11))| \(col("cold (prefill+save)", 20))| \(col("warm (disk)", 13))| \(col("hot (RAM)", 11))| \(col("cold/warm", 10))| outputs")
+    print("\n  \(col("doc tok", 8))| \(col("TTFT cold", 11))| \(col("TTFT warm", 11))| \(col("TTFT new-Q", 11))| \(col("TTFT hot", 10))| \(col("prefill tok/s", 14))| \(col("KiB/tok", 8))| \(col("gen tok/s", 10))| ok")
     for r in rows {
-        let speed = r.warm > 0 ? String(format: "%.0f×", r.cold / r.warm) : "—"
-        print("  \(col("\(r.size)", 11))| \(col(ms(r.cold), 20))| \(col(ms(r.warm), 13))| \(col(r.hot.map(ms) ?? "n/a", 11))| \(col(speed, 10))| \(r.ok ? "✅" : "❌")")
+        print("  \(col("\(r.size)", 8))| \(col(ms(r.coldTtft), 11))| \(col(ms(r.warmTtft), 11))| \(col(ms(r.newQTtft), 11))| \(col(r.hotTtft.map(ms) ?? "n/a", 10))| \(col(String(format: "%.0f", r.prefillTokPerSec), 14))| \(col(String(format: "%.0f", r.kibPerTok), 8))| \(col(String(format: "%.0f", r.warmGenTps), 10))| \(r.ok ? "✅" : "❌")")
     }
 }

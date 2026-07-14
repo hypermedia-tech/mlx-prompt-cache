@@ -138,6 +138,50 @@ A complete, runnable end-to-end example — load a model, cold vs. warm, verify 
 
 Reuse must never change what the model produces. The integration harness verifies this directly: it runs the same prompt **cold** (fresh prefill) and **warm** (reused prefix) under greedy decoding and asserts the outputs are byte-for-byte identical before reporting the speedup.
 
+## Performance
+
+![TTFT](https://img.shields.io/badge/TTFT-up_to_233x_faster-2ea44f)
+![warm TTFT](https://img.shields.io/badge/warm_TTFT-under_160_ms-2ea44f)
+![reuse](https://img.shields.io/badge/reuse-byte--identical-1f6feb)
+![verified on](https://img.shields.io/badge/verified_on-attention_and_hybrid-8957e5)
+
+Reuse turns time-to-first-token from *"prefill the whole context"* into *"prefill only the new question."* The longer the shared prefix, the more it saves — so **the speedup grows with context while warm TTFT stays roughly flat.**
+
+### Time-to-first-token & speedup
+
+Cold (fresh prefill) → warm (reused prefix), at the smallest and largest context tested:
+
+| Model | Arch | Cold TTFT · 2k → 24k | Warm TTFT | Faster by · 2k → 24k |
+| --- | :---: | --- | --- | --- |
+| `Qwen3.6-35B-A3B` | 🧬 hybrid | 1.88 s → 19.4 s | 🟢 68 – 112 ms | 28× → **174×** 🚀 |
+| `Qwen3.5-9B` | 🧬 hybrid | 2.40 s → 34.9 s | 🟢 74 – 150 ms | 33× → **233×** 🚀 |
+| `Qwen3-1.7B` | ⚡ attention | 0.58 s → 12.1 s | 🟡 46 – 317 ms | 13× → **38×** |
+
+### Throughput & footprint
+
+| Model | Prefill | Snapshot / token | Snapshot @ 24k |
+| --- | --- | --- | --- |
+| `Qwen3.6-35B-A3B` | ~1,300 tok/s | 51 → 23 KiB ⬇ | ~0.5 GiB |
+| `Qwen3.5-9B` | ~800 tok/s | 57 → 34 KiB ⬇ | ~0.8 GiB |
+| `Qwen3-1.7B` | ~2,800 tok/s | 112 KiB · flat | ~2.6 GiB |
+
+```mermaid
+xychart-beta
+    title "Qwen3.6-35B-A3B — time to first token (bars = cold prefill, line = warm reuse)"
+    x-axis ["2k context", "24k context"]
+    y-axis "TTFT (seconds)" 0 --> 20
+    bar [1.88, 19.4]
+    line [0.068, 0.112]
+```
+
+**How to read this:**
+
+- 🟢 **Warm TTFT is small and roughly flat regardless of context** — only the new suffix is prefilled, so a repeat question over a huge document answers about as fast as one over a small document.
+- 📈 **The speedup scales with the shared prefix** — a single page saves little; a two-hour transcript or a large log dump saves nearly all of the prefill.
+- 🧬 **Hybrids win twice.** The Mamba/SSM state is fixed-size, so a hybrid model's snapshot *shrinks* per token as context grows — smaller on disk **and** faster to reload than the pure-attention model, whose flat 112 KiB/token cache is what lifts its warm TTFT at 24k.
+
+> Measured on an M4 Max (128 GB, macOS 26) under greedy decoding via the bundled `MLXPromptCacheScratch` harness — a *different* question over the same recorded context (100% of prefix blocks reused; only the ~20-token question suffix re-prefilled), with the `cold == warm == paused-then-resumed` byte-identity gate passing on every model, both pure-attention and hybrid (Mamba/SSM). One machine's numbers — reproduce your own with `swift run MLXPromptCacheScratch`.
+
 ## Limitations
 
 - **Block-aligned reuse** — the trailing partial block is always re-prefilled (default block size 256 tokens).
