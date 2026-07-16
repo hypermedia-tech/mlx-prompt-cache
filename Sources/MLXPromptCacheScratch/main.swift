@@ -248,7 +248,7 @@ for model in models {
         }
     }
     
-    // ── Conversation gate: a HELD SessionCache. Turn 2 prefills only the new question, and the
+    // ── Conversation gate: a HELD SessionStore. Turn 2 prefills only the new question, and the
     //    held-cache answer is token-identical to a cold full-prefill of the whole conversation. ──
     do {
         let document = Array(corpusTokens.prefix(2048))                                   // block-aligned root
@@ -263,25 +263,31 @@ for model in models {
             _ = coordinator.warm(promptTokens: document, model: context.model, parameters: convParams); return 0
         }
 
-        // Both turns inside ONE perform so the non-Sendable [KVCache] never crosses the boundary.
+        let sessions = SessionStore()
+        let convId = UUID()
+
+        // Both turns inside ONE perform. Nothing non-Sendable crosses: `sessions` + `coordinator` + the
+        // UUID are all Sendable; the live [KVCache] is created, grown, and freed inside the store.
         let held: ConvOut = try await mc.perform { context in
-            let session = SessionCache(warmRoot: store.reuse(forTokens: document),
-                                       makeCache: { makePromptCache(model: context.model, parameters: convParams) })
-            // Turn 1 — whole document resident, only the question prefills.
-            let d1in = session.advance(fullPromptTokens: document + qTokens)
+            // Turn 1 — whole document resident (seeded from the warm root), only the question prefills.
+            let (d1in, cache1) = coordinator.advance(sessions, id: convId,
+                fullPromptTokens: document + qTokens, rootTokens: document,
+                model: context.model, parameters: convParams)
             let d1 = d1in.text.tokens.shape.last ?? 0
             let t1 = Date(); var a1: [Int] = []; var ttft1 = 0.0
-            for await g in try generateTokens(input: d1in, cache: session.cache, parameters: convParams, context: context) {
+            for await g in try generateTokens(input: d1in, cache: cache1, parameters: convParams, context: context) {
                 if case .token(let tok) = g { if a1.isEmpty { ttft1 = Date().timeIntervalSince(t1) * 1000 }; a1.append(tok) }
             }
-            // Turn 2 — held cache already carries document+Q1+A1; only Q2 prefills.
-            let d2in = session.advance(fullPromptTokens: document + qTokens + a1 + qbTokens)
+            // Turn 2 — same id ⇒ the SAME live cache (document+Q1+A1 resident); only Q2 prefills.
+            let (d2in, cache2) = coordinator.advance(sessions, id: convId,
+                fullPromptTokens: document + qTokens + a1 + qbTokens, rootTokens: document,
+                model: context.model, parameters: convParams)
             let d2 = d2in.text.tokens.shape.last ?? 0
             let t2 = Date(); var a2: [Int] = []; var ttft2 = 0.0
-            for await g in try generateTokens(input: d2in, cache: session.cache, parameters: convParams, context: context) {
+            for await g in try generateTokens(input: d2in, cache: cache2, parameters: convParams, context: context) {
                 if case .token(let tok) = g { if a2.isEmpty { ttft2 = Date().timeIntervalSince(t2) * 1000 }; a2.append(tok) }
             }
-            session.release()
+            coordinator.release(sessions, id: convId)
             return ConvOut(d1: d1, d2: d2, a1: a1, a2Held: a2, ttft1: ttft1, ttft2: ttft2)
         }
 
@@ -296,10 +302,15 @@ for model in models {
             return ids
         }
 
-        let deltaOnly = held.d1 == qTokens.count && held.d2 == qbTokens.count             // only the new turn prefilled
+        // `warm()` records to the last FULL block only (`(count-1)/blockSize*blockSize`), so a block-aligned
+        // 2048-token doc warms to 1792 — turn 1 re-prefills the un-warmed 256-token tail PLUS the new question.
+        // Turn 2 is the pure-delta proof (only Q2). Assert the honest expectation, not d1 == Q1.
+        let warmBoundary = (document.count - 1) / blockSize * blockSize
+        let expectedD1 = (document.count - warmBoundary) + qTokens.count
+        let deltaOnly = held.d1 == expectedD1 && held.d2 == qbTokens.count                 // turn 2 pure delta; turn 1 + tail
         let heldEqCold = held.a2Held == a2Cold                                            // held == cold, token-identical
-        print("  conversation gate [\(model.id)]​: d1=\(held.d1)(Q \(qTokens.count)) d2=\(held.d2)(Q2 \(qbTokens.count)) · "
-            + "TTFT turn1 \(ms(held.ttft1)) → turn2 \(ms(held.ttft2)) · delta-only \(deltaOnly ? "✅" : "❌") · "
+        print("  conversation gate [\(model.id)]​: d1=\(held.d1)(exp \(expectedD1): tail \(document.count - warmBoundary)+Q \(qTokens.count)) d2=\(held.d2)(Q2 \(qbTokens.count)) · "
+            + "TTFT turn1 \(ms(held.ttft1)) → turn2 \(ms(held.ttft2)) · delta-ok \(deltaOnly ? "✅" : "❌") · "
             + "held==cold \(heldEqCold ? "✅" : "❌")")
         if !heldEqCold { print("    held a2=\(Array(held.a2Held.prefix(12))) · cold a2=\(Array(a2Cold.prefix(12)))") }
     }
