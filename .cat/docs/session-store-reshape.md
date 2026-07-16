@@ -1,5 +1,13 @@
 # SessionCache → SessionStore reshape — implementation plan
 
+> **STATUS — APPLIED · 2026-07-16 · `feature/fix-concurrency`.** Reshape live: `SessionCache` → `SessionStore`
+> (`final class @unchecked Sendable`, `package` primitives), coordinator `advance`/`release` doors, `main.swift`
+> gate, `SessionStoreTests`; old files removed. Compiles clean under `.v6` (complete data-race checking ⇒ no
+> `Sendable` violations). Real-harness proof: **`held==cold ✅`** on Qwen3-1.7B / 3.5-9B / 3.6-35B, turn 2 = pure
+> delta (Q2). The harness `delta-only` check was corrected to expect `warm()`'s block-rounded root (turn 1 =
+> un-warmed doc tail + Q1), clearing a false `❌` → now `delta-ok ✅`. **§8 (disk-IO cleanup) deferred** —
+> unit-provable only (the harness can't exercise concurrent `record`s), outside this ticket's "provable by both" gate.
+
 **Goal:** make the conversation-cache primitive clean under Swift 6.2 strict concurrency by moving
 ownership of the live `[KVCache]` *behind* `ModelContainer`'s serialised access, keyed by `UUID`, so
 nothing non-`Sendable` ever crosses an isolation boundary. No back-compat concern — nothing downstream

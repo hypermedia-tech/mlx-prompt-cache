@@ -184,14 +184,28 @@ extension PromptCacheCoordinator {
 }
 
 extension PromptCacheCoordinator {
-    public func openSession(
+    /// Consumer-facing turn driver — the only public door to the live caches. Requires `model` (only
+    /// reachable via `context.model` inside `perform`), nudging "touch caches inside perform only" at the
+    /// type level. Seeds conversation `id` from the durable disk root (`store.reuse(forTokens: rootTokens)`)
+    /// on the first turn; thereafter the held cache is extended in place, never reloaded.
+    public func advance(
+        _ sessions: SessionStore,
+        id: UUID,
+        fullPromptTokens: [Int],
         rootTokens: [Int],
         model: any LanguageModel,
         parameters: GenerateParameters
-    ) -> SessionCache {
-        SessionCache(
-            warmRoot: store.reuse(forTokens: rootTokens),
+    ) -> (input: LMInput, cache: [KVCache]) {
+        sessions.advance(
+            id: id,
+            fullPromptTokens: fullPromptTokens,
+            warmRoot: { store.reuse(forTokens: rootTokens) },
             makeCache: { makePromptCache(model: model, parameters: parameters) }
         )
+    }
+
+    /// Free conversation `id`'s live cache. Idempotent. Call inside `perform`.
+    public func release(_ sessions: SessionStore, id: UUID) {
+        sessions.release(id)
     }
 }
