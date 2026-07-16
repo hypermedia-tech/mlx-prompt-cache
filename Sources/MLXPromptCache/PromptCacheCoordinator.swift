@@ -182,3 +182,16 @@ extension PromptCacheCoordinator {
         return offset
     }
 }
+
+extension PromptCacheCoordinator {
+    public func openSession(
+        rootTokens: [Int],
+        model: any LanguageModel,
+        parameters: GenerateParameters
+    ) -> SessionCache {
+        SessionCache(
+            warmRoot: store.reuse(forTokens: rootTokens),
+            makeCache: { makePromptCache(model: model, parameters: parameters) }
+        )
+    }
+}

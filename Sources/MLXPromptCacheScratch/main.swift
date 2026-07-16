@@ -64,6 +64,15 @@ struct RunResult: Sendable {
     var suffixStart = 0
     var outcome = ""
 }
+
+struct ConvOut: Sendable {
+    let d1: Int;
+    let d2: Int;
+    let a1: [Int];
+    let a2Held: [Int];
+    let ttft1: Double;
+    let ttft2: Double;
+}
 struct Row {
     let size: Int
     let coldTtft, warmTtft, newQTtft: Double
@@ -237,6 +246,62 @@ for model in models {
             print("    B   = \(textB.prefix(80))")
             print("    cold= \(textCold.prefix(80))")
         }
+    }
+    
+    // ── Conversation gate: a HELD SessionCache. Turn 2 prefills only the new question, and the
+    //    held-cache answer is token-identical to a cold full-prefill of the whole conversation. ──
+    do {
+        let document = Array(corpusTokens.prefix(2048))                                   // block-aligned root
+        let convParams = GenerateParameters(maxTokens: 48, temperature: 0)                // greedy ⇒ held == cold
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxpc-conv-\(UUID().uuidString)")
+        let store = try PromptCacheStore(directory: dir, budgetBytes: 16_000_000_000,
+                                         signature: sig, blockSize: blockSize)
+        let coordinator = PromptCacheCoordinator(store: store)
+
+        // Warm the root to disk so the session SEEDS from it (not a cold prefill).
+        _ = await mc.perform { context -> Int in
+            _ = coordinator.warm(promptTokens: document, model: context.model, parameters: convParams); return 0
+        }
+
+        // Both turns inside ONE perform so the non-Sendable [KVCache] never crosses the boundary.
+        let held: ConvOut = try await mc.perform { context in
+            let session = SessionCache(warmRoot: store.reuse(forTokens: document),
+                                       makeCache: { makePromptCache(model: context.model, parameters: convParams) })
+            // Turn 1 — whole document resident, only the question prefills.
+            let d1in = session.advance(fullPromptTokens: document + qTokens)
+            let d1 = d1in.text.tokens.shape.last ?? 0
+            let t1 = Date(); var a1: [Int] = []; var ttft1 = 0.0
+            for await g in try generateTokens(input: d1in, cache: session.cache, parameters: convParams, context: context) {
+                if case .token(let tok) = g { if a1.isEmpty { ttft1 = Date().timeIntervalSince(t1) * 1000 }; a1.append(tok) }
+            }
+            // Turn 2 — held cache already carries document+Q1+A1; only Q2 prefills.
+            let d2in = session.advance(fullPromptTokens: document + qTokens + a1 + qbTokens)
+            let d2 = d2in.text.tokens.shape.last ?? 0
+            let t2 = Date(); var a2: [Int] = []; var ttft2 = 0.0
+            for await g in try generateTokens(input: d2in, cache: session.cache, parameters: convParams, context: context) {
+                if case .token(let tok) = g { if a2.isEmpty { ttft2 = Date().timeIntervalSince(t2) * 1000 }; a2.append(tok) }
+            }
+            session.release()
+            return ConvOut(d1: d1, d2: d2, a1: a1, a2Held: a2, ttft1: ttft1, ttft2: ttft2)
+        }
+
+        // Cold: prefill the ENTIRE conversation from scratch; its answer must equal the held turn-2 answer.
+        let a2Cold: [Int] = try await mc.perform { context in
+            var ids: [Int] = []
+            for await g in try generateTokens(input: LMInput(tokens: MLXArray(document + qTokens + held.a1 + qbTokens)),
+                                              cache: makePromptCache(model: context.model, parameters: convParams),
+                                              parameters: convParams, context: context) {
+                if case .token(let tok) = g { ids.append(tok) }
+            }
+            return ids
+        }
+
+        let deltaOnly = held.d1 == qTokens.count && held.d2 == qbTokens.count             // only the new turn prefilled
+        let heldEqCold = held.a2Held == a2Cold                                            // held == cold, token-identical
+        print("  conversation gate [\(model.id)]​: d1=\(held.d1)(Q \(qTokens.count)) d2=\(held.d2)(Q2 \(qbTokens.count)) · "
+            + "TTFT turn1 \(ms(held.ttft1)) → turn2 \(ms(held.ttft2)) · delta-only \(deltaOnly ? "✅" : "❌") · "
+            + "held==cold \(heldEqCold ? "✅" : "❌")")
+        if !heldEqCold { print("    held a2=\(Array(held.a2Held.prefix(12))) · cold a2=\(Array(a2Cold.prefix(12)))") }
     }
 
     print("\n  \(col("doc tok", 8))| \(col("TTFT cold", 11))| \(col("TTFT warm", 11))| \(col("TTFT new-Q", 11))| \(col("TTFT hot", 10))| \(col("prefill tok/s", 14))| \(col("KiB/tok", 8))| \(col("gen tok/s", 10))| ok")
