@@ -184,6 +184,145 @@ extension PromptCacheCoordinator {
 }
 
 extension PromptCacheCoordinator {
+
+    /// Warm a prefix while **holding the live cache across pauses**, so a resume neither reloads the
+    /// prefix nor rewrites it. The residency twin of `warm(promptTokens:model:parameters:shouldPause:)`.
+    ///
+    /// `id` names this warm; pass the same `id` after a `.paused` to resume from the held cache with
+    /// no snapshot IO at all. If `id` is not resident — first call, released, evicted, fresh process —
+    /// this falls back to **exactly** the disk behaviour of the original `warm`: peek, reuse the
+    /// longest cached prefix, continue. Residency is an accelerator, never a source of truth.
+    ///
+    /// A held cache is only reused when the caller's tokens hash to the frontier recorded when it was
+    /// held. A mismatch is declined, not extended — extending a diverged cache and then recording it
+    /// would poison the catalog with a snapshot whose contents do not match its chain hash.
+    ///
+    /// Call inside `ModelContainer.perform` (see `WarmStore`'s type invariant).
+    public func warm(
+        _ warms: WarmStore,
+        id: UUID,
+        promptTokens: [Int],
+        model: any LanguageModel,
+        parameters: GenerateParameters,
+        persist: WarmPersistence = .onCompletion,
+        shouldPause: () -> Bool = { false }
+    ) -> PromptWarmOutcome {
+        let boundary = max(0, (promptTokens.count - 1) / store.blockSize) * store.blockSize
+        guard boundary > 0 else {
+            return .uncacheable(reason: "prompt < one \(store.blockSize)-block")
+        }
+
+        // 1. Resident? Verify the held cache covers THESE tokens before trusting it.
+        var cache: [KVCache]
+        var start: Int
+        if let heldTokens = warms.heldTokenCount(id),
+           heldTokens <= promptTokens.count,
+           let resumed = warms.resume(id, expecting: store.frontierHash(forTokens: promptTokens,
+                                                                       upTo: heldTokens)) {
+            cache = resumed.cache
+            start = resumed.tokens
+        } else {
+            // 2. Not resident → the original path, unchanged.
+            if store.peek(forTokens: promptTokens) >= boundary {
+                return .complete(cachedTokens: boundary, prefilled: 0)
+            }
+            let reused = store.reuse(forTokens: promptTokens)
+            start = reused?.matchedTokens ?? 0
+            cache = reused?.cache ?? makePromptCache(model: model, parameters: parameters)
+        }
+
+        guard start < boundary else {
+            // Already at the boundary: persist if we are holding unpersisted work, then finish.
+            return finishWarm(warms, id: id, model: model)
+        }
+
+        // 3. Chunked prefill, pausing on block boundaries so a hybrid's recurrent state always sits
+        //    exactly at a boundary — the only shape its snapshot is valid in.
+        let reached = prefillChunked(
+            Array(promptTokens[0 ..< boundary]),
+            into: cache,
+            from: start,
+            model: model,
+            stepSize: parameters.prefillStepSize,
+            shouldPause: shouldPause
+        )
+        guard reached > start, PromptCacheIO.tokenLength(cache) == reached else {
+            return .uncacheable(reason: "prefill did not advance")
+        }
+
+        let prefix = Array(promptTokens[0 ..< reached])
+        warms.hold(id, cache: cache, prefix: prefix,
+                   frontier: store.frontierHash(forTokens: promptTokens, upTo: reached))
+
+        // 4. Persist per policy — NOT on every pause. A save holds a process-global MLX lock for its
+        //    whole duration, so doing it per pause stalls the interactive work the pause exists for.
+        let done = reached == boundary
+        let sinceLast = reached - (warms.entry(id)?.persistedTokens ?? 0)
+        let shouldWrite: Bool
+        switch persist {
+        case .never: shouldWrite = false
+        case .onCompletion: shouldWrite = done
+        case let .everyTokens(k): shouldWrite = done || (k > 0 && sinceLast >= k)
+        }
+        if shouldWrite { persistHeld(warms, id: id) }
+
+        // 5. Budget: persist-then-release the largest other warms if we are over.
+        for victim in warms.victimsOverBudget(excluding: id) {
+            persistHeld(warms, id: victim)
+            warms.release(victim)
+        }
+
+        if done {
+            // Give the memory back ONLY when the work is safely on disk. Releasing unconditionally
+            // would mean `.never` completes, writes nothing, and silently discards the whole warm —
+            // so under `.never` the cache stays resident and the caller must `finishWarm` (persist
+            // and free) or `release` (discard deliberately).
+            if shouldWrite { warms.release(id) }
+            return .complete(cachedTokens: boundary, prefilled: boundary - start)
+        }
+        return .paused(cachedTokens: reached)
+    }
+
+    /// Persist whatever `id` has reached and release it. Call when abandoning a warm that will not be
+    /// resumed — tab closed, file deselected, memory pressure — so the work is not thrown away.
+    /// Idempotent; a `nil`/absent id is a no-op.
+    ///
+    /// Takes `model` it does not use, deliberately: `model` is only reachable via `context.model`
+    /// inside `ModelContainer.perform`, which is where this must be called. Same nudge as `advance`.
+    @discardableResult
+    public func finishWarm(
+        _ warms: WarmStore,
+        id: UUID,
+        model: any LanguageModel
+    ) -> PromptWarmOutcome {
+        guard let e = warms.entry(id) else { return .uncacheable(reason: "no warm held for id") }
+        persistHeld(warms, id: id)
+        warms.release(id)
+        return .complete(cachedTokens: e.prefix.count, prefilled: 0)
+    }
+
+    /// The live cache held for `id`, for generating directly off a warm without a disk round trip.
+    /// `nil` if nothing is held. Requires `model` for the same reason as `finishWarm`: this hands
+    /// back a non-`Sendable` `[KVCache]` that must not leave the `perform` it was obtained in.
+    public func heldCache(
+        _ warms: WarmStore,
+        id: UUID,
+        model: any LanguageModel
+    ) -> [KVCache]? {
+        warms.entry(id)?.cache
+    }
+
+    /// Write the held prefix for `id` to disk, if there is unpersisted work. `record` refuses cleanly
+    /// (logging its own SKIP) for a hybrid off a boundary or a pure-SSM model, so this is best-effort
+    /// by design — the same contract the non-resident `warm` already has.
+    private func persistHeld(_ warms: WarmStore, id: UUID) {
+        guard let e = warms.entry(id), e.prefix.count > e.persistedTokens else { return }
+        try? store.record(prefixTokens: e.prefix, cache: e.cache)
+        warms.markPersisted(id, tokens: e.prefix.count)
+    }
+}
+
+extension PromptCacheCoordinator {
     /// Consumer-facing turn driver — the only public door to the live caches. Requires `model` (only
     /// reachable via `context.model` inside `perform`), nudging "touch caches inside perform only" at the
     /// type level. Seeds conversation `id` from the durable disk root (`store.reuse(forTokens: rootTokens)`)

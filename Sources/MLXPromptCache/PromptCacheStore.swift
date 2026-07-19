@@ -120,6 +120,15 @@ public final class PromptCacheStore: Sendable {
         return matched
     }
 
+    /// Chain hash of the first `n` tokens' last full block — the key `WarmStore` uses to verify that
+    /// a held cache actually covers the tokens a resume is asking about. Keeps `signature` private
+    /// while letting the coordinator build the same hash the catalog keys on.
+    package func frontierHash(forTokens tokens: [Int], upTo n: Int) -> BlockHash? {
+        guard n > 0, n <= tokens.count else { return nil }
+        return BlockHasher.boundaries(for: Array(tokens[0 ..< n]),
+                                      blockSize: blockSize, signature: signature).last
+    }
+
     private func write(prefixTokens: [Int], cache: [KVCache], warmHot: Bool) throws {
         let hashes = BlockHasher.boundaries(for: prefixTokens, blockSize: blockSize, signature: signature)
         let types = Set(cache.map { String(describing: type(of: $0)) }).sorted().joined(separator: ", ")

@@ -1,0 +1,601 @@
+<title>Write Amplification in a Persistent KV-Cache Warm Loop</title>
+
+<style>
+  :root {
+    --ground:      #FBFBFC;
+    --ground-sunk: #F3F4F7;
+    --ink:         #14171C;
+    --ink-soft:    #4A525E;
+    --ink-faint:   #78818F;
+    --rule:        #DEE3E9;
+    --rule-strong: #C3CAD4;
+    --accent:      #1F5673;
+    --accent-soft: #EAF1F6;
+    --amber:       #A85B22;
+    --amber-soft:  #FAF1E8;
+    --good:        #2E6B4A;
+
+    --serif: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:      #0F1317;
+      --ground-sunk: #161B21;
+      --ink:         #E4E9EE;
+      --ink-soft:    #A3ADB9;
+      --ink-faint:   #78838F;
+      --rule:        #262D35;
+      --rule-strong: #3A434D;
+      --accent:      #6FAFD0;
+      --accent-soft: #16242D;
+      --amber:       #D6A06A;
+      --amber-soft:  #241B12;
+      --good:        #6FB58C;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0F1317;
+    --ground-sunk: #161B21;
+    --ink:         #E4E9EE;
+    --ink-soft:    #A3ADB9;
+    --ink-faint:   #78838F;
+    --rule:        #262D35;
+    --rule-strong: #3A434D;
+    --accent:      #6FAFD0;
+    --accent-soft: #16242D;
+    --amber:       #D6A06A;
+    --amber-soft:  #241B12;
+    --good:        #6FB58C;
+  }
+  :root[data-theme="light"] {
+    --ground:      #FBFBFC;
+    --ground-sunk: #F3F4F7;
+    --ink:         #14171C;
+    --ink-soft:    #4A525E;
+    --ink-faint:   #78818F;
+    --rule:        #DEE3E9;
+    --rule-strong: #C3CAD4;
+    --accent:      #1F5673;
+    --accent-soft: #EAF1F6;
+    --amber:       #A85B22;
+    --amber-soft:  #FAF1E8;
+    --good:        #2E6B4A;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 4.5rem 1.5rem 7rem;
+  }
+
+  /* ─── masthead ─────────────────────────────────────────── */
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1.4rem;
+  }
+
+  h1 {
+    font-size: clamp(1.9rem, 5vw, 2.7rem);
+    line-height: 1.12;
+    font-weight: 600;
+    letter-spacing: -0.021em;
+    text-wrap: balance;
+    margin: 0 0 1rem;
+  }
+
+  .standfirst {
+    font-size: 1.15rem;
+    color: var(--ink-soft);
+    line-height: 1.55;
+    text-wrap: pretty;
+    margin: 0 0 2rem;
+  }
+
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.6rem;
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    color: var(--ink-faint);
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    padding: 0.9rem 0;
+    margin: 0 0 3.2rem;
+  }
+  .meta b { color: var(--ink-soft); font-weight: 500; }
+
+  /* ─── headline figures ─────────────────────────────────── */
+
+  .figures {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 0 0 3.2rem;
+  }
+  .fig { background: var(--ground); padding: 1.1rem 1.2rem; }
+  .fig .n {
+    font-family: var(--mono);
+    font-size: 1.6rem;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    color: var(--accent);
+    display: block;
+    line-height: 1.1;
+  }
+  .fig .l {
+    font-size: 0.79rem;
+    color: var(--ink-soft);
+    line-height: 1.35;
+    display: block;
+    margin-top: 0.4rem;
+  }
+
+  /* ─── sections ─────────────────────────────────────────── */
+
+  section { margin: 0 0 3rem; }
+
+  h2 {
+    font-size: 1.28rem;
+    font-weight: 600;
+    letter-spacing: -0.012em;
+    margin: 0 0 1rem;
+    padding-top: 1.6rem;
+    border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 0.76rem;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+    margin-right: 0.7rem;
+    vertical-align: 0.14em;
+  }
+
+  h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 2rem 0 0.6rem;
+    color: var(--ink);
+  }
+
+  p { margin: 0 0 1.05rem; text-wrap: pretty; }
+
+  ul { margin: 0 0 1.05rem; padding-left: 1.15rem; }
+  li { margin-bottom: 0.5rem; }
+  li::marker { color: var(--ink-faint); }
+
+  code, .m {
+    font-family: var(--mono);
+    font-size: 0.855em;
+    font-variant-numeric: tabular-nums;
+  }
+  code {
+    background: var(--ground-sunk);
+    padding: 0.09em 0.34em;
+    border-radius: 2px;
+    color: var(--ink-soft);
+  }
+
+  strong { font-weight: 600; }
+  em { font-style: italic; color: var(--ink-soft); }
+
+  /* ─── data tables ──────────────────────────────────────── */
+
+  .scroll { overflow-x: auto; margin: 0 0 1.2rem; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 0.775rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  caption {
+    caption-side: top;
+    text-align: left;
+    font-family: var(--serif);
+    font-size: 0.87rem;
+    color: var(--ink-soft);
+    padding: 0 0 0.6rem;
+    white-space: normal;
+  }
+  th {
+    text-align: right;
+    font-weight: 500;
+    color: var(--ink-faint);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-size: 0.67rem;
+    padding: 0 0.85rem 0.5rem 0;
+    border-bottom: 1px solid var(--rule-strong);
+  }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; }
+  th:last-child, td:last-child { padding-right: 0; }
+  td {
+    text-align: right;
+    padding: 0.46rem 0.85rem 0.46rem 0;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-soft);
+  }
+  td:first-child { color: var(--ink); }
+  td.pos { color: var(--accent); }
+  td.good { color: var(--good); }
+
+  /* ─── correction callouts ──────────────────────────────── */
+
+  .correction {
+    background: var(--amber-soft);
+    border-left: 2px solid var(--amber);
+    padding: 1.1rem 1.3rem 0.4rem;
+    margin: 0 0 1.3rem;
+  }
+  .correction .tag {
+    font-family: var(--mono);
+    font-size: 0.67rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--amber);
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  .correction p:last-child { margin-bottom: 0.7rem; }
+
+  .note {
+    border-left: 2px solid var(--rule-strong);
+    padding: 0.15rem 0 0.15rem 1.2rem;
+    margin: 0 0 1.2rem;
+    color: var(--ink-soft);
+    font-size: 0.95rem;
+  }
+
+  .verdict {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    padding: 1.2rem 1.4rem 0.5rem;
+    margin: 0 0 1.4rem;
+  }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    margin-top: 3.5rem;
+    padding-top: 1.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-faint);
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="page">
+
+  <p class="eyebrow">MLXPromptCache · Engineering Report</p>
+
+  <h1>Write Amplification in a Persistent KV-Cache Warm Loop</h1>
+
+  <p class="standfirst">
+    A background cache warmer was rewriting its entire prefix to disk on every pause, producing
+    write volume quadratic in the number of resumes. This reports the diagnosis, an exact
+    architectural cost model, the fix, and — at equal length — the three claims the measurements
+    forced us to withdraw.
+  </p>
+
+  <div class="meta">
+    <span><b>Subject</b> MLXPromptCache 0.4.1</span>
+    <span><b>Models</b> Qwen3.6-35B-A3B · Qwen3.5-9B · Qwen3-1.7B (MLX 4-bit)</span>
+    <span><b>Host</b> Apple silicon, 137 GB</span>
+    <span><b>Status</b> Measured; not yet implemented</span>
+  </div>
+
+  <div class="figures">
+    <div class="fig"><span class="n">0.00%</span><span class="l">error between predicted and measured per-token cost, on three architectures</span></div>
+    <div class="fig"><span class="n">5.1&times;</span><span class="l">reduction in bytes written, production model</span></div>
+    <div class="fig"><span class="n">39/39</span><span class="l">gates passed across all models</span></div>
+    <div class="fig"><span class="n">1.02&times;</span><span class="l">wall-clock change — the result we did <em>not</em> get</span></div>
+  </div>
+
+  <section>
+    <h2><span class="num">01</span>The symptom</h2>
+    <p>
+      The package keeps a persistent prefix KV-cache so a long document is prefilled once and reused
+      across many prompts. A background warmer builds that prefix incrementally, yielding to
+      interactive work between chunks and resuming afterwards.
+    </p>
+    <p>
+      Each resume was writing a fresh whole-prefix snapshot and evicting the previous one. Warming
+      one 183,018-token log across five observed resumes wrote 7.1 GB to reach 51% of the file,
+      projecting to roughly 34 GB for a single document — plus a full read of the previous snapshot
+      on every resume.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">02</span>An exact cost model</h2>
+    <p>
+      Snapshot size is affine in prefix length: <code>bytes(N) = A·N + M</code>. The useful result is
+      that both constants are <strong>architectural</strong> — computable from a model's
+      <code>config.json</code> before any weights are loaded:
+    </p>
+    <ul>
+      <li><span class="m">A</span> = attention layers &times; 2 (K,V) &times; kv-heads &times; head-dim &times; 2 bytes — the per-token attention cost.</li>
+      <li><span class="m">M</span> = linear layers &times; (value-heads &times; key-head-dim &times; value-head-dim &times; 4 bytes) — the fixed recurrent state, plus a small convolution term.</li>
+    </ul>
+    <p>
+      Predicting first and measuring second matters: fitting <span class="m">A</span> and
+      <span class="m">M</span> to file sizes and then checking them against those same file sizes is
+      an arithmetic identity, not a measurement. Predicted against measured:
+    </p>
+
+    <div class="scroll">
+      <table>
+        <caption>Per-token attention cost and fixed recurrent cost, predicted from config versus measured.</caption>
+        <thead>
+          <tr><th>Model</th><th>A predicted</th><th>A measured</th><th>Error</th><th>M predicted</th><th>M measured</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>35B-A3B</td><td>20,480 B</td><td class="pos">20,480 B</td><td class="good">0.00%</td><td>&ge; 62.9 MB</td><td>64.4 MB</td></tr>
+          <tr><td>9B</td><td>32,768 B</td><td class="pos">32,768 B</td><td class="good">0.00%</td><td>&ge; 50.3 MB</td><td>51.5 MB</td></tr>
+          <tr><td>1.7B</td><td>114,688 B</td><td class="pos">114,688 B</td><td class="good">0.00%</td><td>0</td><td>5.5 kB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The 35B's residual — 64.4 MB measured against a 62.9 MB state-space-only prediction — is
+      3.2 MB, or roughly 107 kB per linear layer, which is the convolution state the prediction
+      deliberately omits. The 1.7B's 5.5 kB is the safetensors header.
+    </p>
+    <p>
+      This decomposition is what makes the rest tractable. The 35B is <em>20 KiB per token of
+      sliceable attention KV, plus 64 MB of recurrent state that does not grow at all</em>. The two
+      halves have entirely different economics and must be costed separately.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">03</span>Root cause</h2>
+    <p>Three mechanisms compose into the quadratic:</p>
+    <ul>
+      <li>The save path copies the whole live cache and serialises it unconditionally. There is no delta or append path for any model type.</li>
+      <li>The catalog's record planner gates on <em>at least one</em> block being new, then re-plans <em>every</em> boundary — so a snapshot covering N blocks claims all N, not the handful that are new.</li>
+      <li>Commit therefore transfers every boundary to the new file, the previous snapshot is left owning none, and it is collected as an orphan. This is the <code>evicted 1</code> observed on every round: not LRU pressure, but correct orphan collection of a genuinely redundant file.</li>
+    </ul>
+    <p>
+      An earlier reading of this code held that the planner already skipped catalogued blocks, and
+      that only the storage layer was non-incremental. That was wrong in a way that matters: the
+      index is block-granular, but the <em>write plan</em> is not, and a source comment in the
+      coordinator asserts the opposite.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">04</span>The intervention</h2>
+    <p>
+      The warm entry point returns only an outcome enum, so the live cache it builds is a local and
+      is dropped on return. A caller cannot hold it. Every resume must therefore begin by reloading
+      the entire prefix from disk, and must end by writing it back.
+    </p>
+    <p>
+      The fix is to hold the live cache across pauses, keyed by an identifier, and persist on
+      completion or abandonment rather than on every yield — the pattern the package already ships
+      for multi-turn conversations. Persistence becomes a durability decision instead of the resume
+      mechanism.
+    </p>
+    <p>
+      A container constraint shapes the API: the model container's <code>perform</code> is generic
+      over a <code>Sendable</code> return, so a value containing the cache cannot be returned out of
+      it at all. Returning an opaque handle to the caller is therefore not merely inadvisable — it
+      does not compile without an escape hatch the codebase has a standing check to keep removed.
+      The holder must live library-side and be reached through a <code>Sendable</code> key.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">05</span>Method</h2>
+    <p>
+      The intervention was measured <strong>before</strong> being implemented. A benchmark harness
+      drives the counterfactual arm entirely in harness code against the existing public API, so the
+      hypothesis could be falsified without committing to a design.
+    </p>
+    <p>Five design decisions, each answering a specific way the experiment could have lied:</p>
+    <ul>
+      <li><strong>Predicted, not fitted.</strong> Constants derive from config before weights load, so the comparison is falsifiable.</li>
+      <li><strong>File sizes are labelled "logical" and are never the headline.</strong> Summed file sizes are not I/O. Wall clock, forced device flush, and per-process disk counters are the primary observables.</li>
+      <li><strong>Both arms are pinned to an identical chunk sequence</strong> so the losslessness check tests residency rather than floating-point associativity.</li>
+      <li><strong>Every arm asserts it did work.</strong> Without a per-chunk offset assertion, "performed no I/O" is indistinguishable from "performed nothing", and both residency gates would pass on an empty function body.</li>
+      <li><strong>A positive control.</strong> A losslessness gate that cannot fail proves nothing, so the comparator must first be shown to detect a known difference.</li>
+    </ul>
+    <p>
+      A further hazard, orthogonal to this work but worth recording: the generation API does not run
+      inside the caller's <code>perform</code> — it boxes the cache and launches a detached task, and
+      its stream is <code>Sendable</code>, so the compiler permits returning it and draining it
+      outside the serialised domain. That places two live caches on the GPU concurrently with no
+      diagnostic. The rule is a convention today; it should be documented.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">06</span>Results</h2>
+
+    <div class="scroll">
+      <table>
+        <caption>Warming 16,384 tokens across 8 pause/resume rounds. Logical bytes are exact counts reported by the store itself.</caption>
+        <thead>
+          <tr><th>Model</th><th>Baseline write</th><th>Residency write</th><th>Reduction</th><th>Baseline read</th><th>Residency read</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>35B-A3B</td><td>2.02 GB</td><td class="pos">394.7 MB</td><td class="good">5.1&times;</td><td>1.63 GB</td><td class="pos">0 B</td></tr>
+          <tr><td>9B</td><td>2.82 GB</td><td class="pos">580.0 MB</td><td class="good">4.9&times;</td><td>2.24 GB</td><td class="pos">0 B</td></tr>
+          <tr><td>1.7B</td><td>8.43 GB</td><td class="pos">1.85 GB</td><td class="good">4.6&times;</td><td>6.58 GB</td><td class="pos">0 B</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Write volume scales as <span class="m">(R+1)/2</span> in the resume count. At the production
+      workload — 183k tokens, seventeen resumes — that is <strong>34.8 GB reduced to 3.81 GB, a
+      factor of 9.1</strong>.
+    </p>
+
+    <h3>Correctness</h3>
+    <p>
+      Generating directly from the held cache, with no persist and no reload, is token-identical to
+      a cold no-cache prefill on all three models. This is the arm that de-risks the change itself;
+      the persist-and-reload arms only exercise a snapshot codec that already has coverage.
+    </p>
+    <p>
+      The positive control confirms the comparator is sensitive — caches over differing content
+      diverge by up to 423 in maximum absolute difference. Against that baseline, one incidental
+      finding stands out: prefilling in 256-token versus 512-token chunks produces
+      <strong>bit-identical state, zero difference across all 60 recurrent and 20 attention
+      tensors</strong> on the 35B. The gated-delta recurrent scan is invariant to chunk boundary.
+      The quantity we were most concerned about perturbing does not perturb.
+    </p>
+
+    <h3>Cost of a single persist</h3>
+    <p>
+      The serialiser holds a process-global evaluation lock for the entire write. Not merely the
+      model container — every tensor evaluation anywhere in the process blocks, including work
+      belonging to a different model.
+    </p>
+
+    <div class="scroll">
+      <table>
+        <caption>Persist cost, and the maximum stall observed by an independent probe evaluating a tiny tensor in a loop.</caption>
+        <thead>
+          <tr><th>Model</th><th>Snapshot</th><th>Write</th><th>Device flush</th><th>Max global stall</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>35B-A3B</td><td>394.7 MB</td><td>55 ms</td><td>111 ms</td><td class="pos">261 ms</td></tr>
+          <tr><td>9B</td><td>580.0 MB</td><td>81 ms</td><td>78 ms</td><td class="pos">340 ms</td></tr>
+          <tr><td>1.7B</td><td>1.85 GB</td><td>331 ms</td><td>223 ms</td><td class="pos">288 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The baseline pays this eight times per warm; residency pays it once. Each stall currently lands
+      immediately after an interactive turn hands control back to the warmer — which is to say, the
+      remedy for holding the GPU triggers the condition it is treating.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">07</span>Three claims withdrawn</h2>
+    <p>
+      Each of these was asserted in an earlier draft of the analysis and then falsified by the
+      instrument built to check it. They are recorded because a report that only lists confirmations
+      is not evidence that the instrument works.
+    </p>
+
+    <div class="correction">
+      <span class="tag">Correction 1 — round-trip saving overstated</span>
+      <p>
+        The initial estimate claimed roughly 17&times; less round-trip I/O, counting eliminated reads
+        as recovered cost. Measured device reads were <strong>0 bytes</strong>. Nothing in the
+        serialisation layer flushes to disk, so a snapshot written seconds earlier is entirely
+        resident and its re-read is served from RAM. The defensible figure is the write half alone:
+        5.1&times; here, 9.1&times; projected at production scale.
+      </p>
+    </div>
+
+    <div class="correction">
+      <span class="tag">Correction 2 — no meaningful wall-clock gain</span>
+      <p>
+        Overhead was estimated at 22% of warm time by subtracting an assumed prefill rate from
+        observed round times. Direct measurement of both arms gives <strong>1.02&times; on the 35B
+        and 1.01&times; on the 9B</strong>. The residency arm's per-round time rises on exactly the
+        same curve as the baseline while performing zero I/O — so that growth was never I/O cost. It
+        is attention cost scaling with context.
+      </p>
+      <p>
+        Only the 1.7B shows a real gain, 1.21&times;, and only because it writes 8.43 GB against the
+        35B's 2.02 GB. The wall-clock benefit tracks bytes written, and hybrid models write little
+        per token.
+      </p>
+    </div>
+
+    <div class="correction">
+      <span class="tag">Correction 3 — persist stall shorter than projected</span>
+      <p>
+        A process-wide freeze of 0.6–2.0 seconds was projected from assumed disk bandwidth. Measured:
+        55–331 ms for these snapshot sizes. The write reaches the page cache at roughly 6 GB/s and
+        returns; it never touches the device synchronously. The projection was not wrong in mechanism,
+        only in magnitude, and it remains unmeasured at production snapshot sizes.
+      </p>
+    </div>
+
+    <p class="note">
+      Three benchmark gates also failed on first run and were traced to defects in the harness rather
+      than the subject: an off-by-one in the largest calibration point, a control that perturbed a
+      genuine invariance instead of testing instrument sensitivity, and a cache-tier probe that
+      sampled one call too early. All three now pass.
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="num">08</span>What is not claimed</h2>
+    <ul>
+      <li><strong>This is not a latency improvement</strong> on a host with abundant free memory. It is a reduction in bytes written, in stall count, and in page-cache pressure.</li>
+      <li><strong>The benefit on memory-constrained hosts is argued, not measured.</strong> Every re-read on the test host was a page-cache hit. On a machine that cannot hold a multi-gigabyte snapshot resident alongside model weights, those reads become real device reads — plausibly the regime where the wall-clock case exists. Untested.</li>
+      <li><strong>The production workload was not measured directly.</strong> Results are at 16,384 tokens and eight resumes; the 183k-token figure is extrapolated from an exact model, but extrapolated.</li>
+      <li><strong>Residency's transient memory is unquantified.</strong> The cache grows by concatenation, holding both buffers live, so peak is expected near twice the settled footprint.</li>
+      <li><strong>Nothing is implemented.</strong> The harness proves the counterfactual; the library change has not been written.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2><span class="num">09</span>Assessment</h2>
+    <div class="verdict">
+      <p>
+        The reported problem was volume — tens of gigabytes written to warm a single document. That
+        problem is solved, by a factor of roughly nine at production scale, with correctness
+        demonstrated by direct generation from the held cache on three model architectures.
+      </p>
+      <p>
+        The problem was never latency on a well-provisioned host, and the work should not be sold as
+        though it were. The secondary benefits — eight process-global stalls reduced to one, and a
+        five-fold drop in page-cache churn — are real but were not what was originally asked about.
+      </p>
+    </div>
+    <p>
+      The most transferable result is not the fix. It is that the cost model is exact and
+      architectural: for any future model, both constants follow from its configuration file before
+      it is ever loaded, which turns cache sizing from a measurement exercise into arithmetic.
+    </p>
+  </section>
+
+  <footer>
+    Measurements from <code>MLXPromptCacheBench</code>, run 2026-07-19 on Apple silicon with 137 GB
+    unified memory and 190 GB free storage, thermal state nominal. Thirty-nine gates across three
+    models; all passing. Raw per-round data and the machine-readable artifact accompany the run.
+  </footer>
+
+</div>
