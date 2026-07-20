@@ -59,6 +59,7 @@ import Testing
         let saves = lines.withLock { $0.filter { $0.hasPrefix("record: saved") }.count }
         #expect(loads == 0)                                     // nothing reloaded…
         #expect(saves == 0)                                     // …and nothing written on a pause
+        #expect(snapshotCount(in: dir) == 0)                    // log-independent proof: disk untouched
         #expect(warms.residentBytes > 0)
     }
 
@@ -72,15 +73,15 @@ import Testing
 
         _ = coord.warm(warms, id: id, promptTokens: tokens, model: model,
                        parameters: blockStepParams(), shouldPause: { true })
-        let first = coord.heldCache(warms, id: id, model: model)
+        let first = try #require(coord.heldCache(warms, id: id, model: model))
         _ = coord.warm(warms, id: id, promptTokens: tokens, model: model,
                        parameters: blockStepParams(), shouldPause: { true })
-        let second = coord.heldCache(warms, id: id, model: model)
+        let second = try #require(coord.heldCache(warms, id: id, model: model))
 
-        #expect(first?.count == 2)
+        #expect(first.count == 2)
         // Extended in place, never rebuilt — the same layer objects carry forward.
-        #expect(ObjectIdentifier(first![1] as AnyObject) == ObjectIdentifier(second![1] as AnyObject))
-        #expect(PromptCacheIO.tokenLength(second ?? []) == 512)
+        #expect(ObjectIdentifier(first[1] as AnyObject) == ObjectIdentifier(second[1] as AnyObject))
+        #expect(PromptCacheIO.tokenLength(second) == 512)
     }
 
     // MARK: - The divergence guard
@@ -160,7 +161,7 @@ import Testing
         let out = coord.warm(warms, id: id, promptTokens: tokens, model: model,
                              parameters: blockStepParams(), persist: .never)
         guard case .complete = out else { Issue.record("expected .complete, got \(out)"); return }
-        #expect(!warms.isEmpty)                                 // the work is still recoverable…
+        #expect(warms.isEmpty == false)                        // the work is still recoverable…
         #expect(PromptCacheIO.tokenLength(coord.heldCache(warms, id: id, model: model) ?? []) == 512)
 
         _ = coord.finishWarm(warms, id: id, model: model)       // …and finishWarm can still save it
@@ -195,12 +196,12 @@ import Testing
         let id = UUID()
         let tokens = Fixture.tokens(2000)
 
-        for _ in 0 ..< 2 {
-            _ = coord.warm(warms, id: id, promptTokens: tokens, model: twoLayerModel(),
-                           parameters: blockStepParams(), persist: .everyTokens(512),
-                           shouldPause: { true })
-        }
-        #expect(store.peek(forTokens: tokens) == 512)           // fired at the 512-token mark
+        _ = coord.warm(warms, id: id, promptTokens: tokens, model: twoLayerModel(),
+                       parameters: blockStepParams(), persist: .everyTokens(512), shouldPause: { true })
+        #expect(store.peek(forTokens: tokens) == 0)             // 256 < cadence → gate holds, no write yet
+        _ = coord.warm(warms, id: id, promptTokens: tokens, model: twoLayerModel(),
+                       parameters: blockStepParams(), persist: .everyTokens(512), shouldPause: { true })
+        #expect(store.peek(forTokens: tokens) == 512)           // 512 ≥ cadence → fired
     }
 
     // MARK: - Degrades losslessly to the disk path
@@ -279,6 +280,67 @@ import Testing
                        parameters: blockStepParams(), shouldPause: { true })
         #expect(warms.heldIds == [b])
         #expect(store.peek(forTokens: ta) == 256)               // a's progress survived on disk
+    }
+
+    // MARK: - Non-resident fast paths (residency is a strict accelerator; these are the disk twin's edges)
+
+    /// A fresh id over an already-warm prefix takes the catalog peek short-circuit: not resident → peek
+    /// ≥ boundary → complete with `prefilled == 0` and NO new snapshot write.
+    @Test func nonResidentAlreadyWarmIsPeekOnlyComplete() throws {
+        let dir = Fixture.tempDir()
+        let store = try makeStore(dir)
+        let coord = PromptCacheCoordinator(store: store)
+        let tokens = Fixture.tokens(600)                        // boundary 512
+        guard case .complete = coord.warm(WarmStore(), id: UUID(), promptTokens: tokens,
+                                          model: twoLayerModel(), parameters: blockStepParams())
+        else { Issue.record("first warm did not complete"); return }
+        let snapshotsAfterFirst = snapshotCount(in: dir)
+
+        let out = coord.warm(WarmStore(), id: UUID(), promptTokens: tokens,
+                             model: twoLayerModel(), parameters: blockStepParams())
+        guard case let .complete(cached, prefilled) = out else {
+            Issue.record("expected .complete, got \(out)"); return
+        }
+        #expect(cached == 512)
+        #expect(prefilled == 0)                                 // peek hit — no reuse load, no prefill
+        #expect(snapshotCount(in: dir) == snapshotsAfterFirst)  // nothing re-written
+    }
+
+    /// A `.never` warm completes but stays resident. Re-warming the same id finds the held cache already
+    /// at the boundary (`start == boundary`) and routes to `finishWarm`, which persists and releases.
+    @Test func residentAtBoundaryReWarmFinishesFromHeld() throws {
+        let dir = Fixture.tempDir()
+        let store = try makeStore(dir)
+        let coord = PromptCacheCoordinator(store: store)
+        let warms = WarmStore()
+        let id = UUID()
+        let tokens = Fixture.tokens(600)                        // boundary 512
+        guard case .complete = coord.warm(warms, id: id, promptTokens: tokens, model: twoLayerModel(),
+                                          parameters: blockStepParams(), persist: .never)
+        else { Issue.record("warm did not complete"); return }
+        #expect(store.peek(forTokens: tokens) == 0)             // .never wrote nothing…
+        #expect(warms.isEmpty == false)                         // …and kept it resident
+
+        let out = coord.warm(warms, id: id, promptTokens: tokens, model: twoLayerModel(),
+                             parameters: blockStepParams(), persist: .never)
+        guard case let .complete(cached, prefilled) = out else {
+            Issue.record("expected .complete, got \(out)"); return
+        }
+        #expect(cached == 512)
+        #expect(prefilled == 0)                                 // nothing left to prefill
+        #expect(store.peek(forTokens: tokens) == 512)           // finishWarm persisted it…
+        #expect(warms.isEmpty)                                  // …and released
+    }
+
+    /// `finishWarm` on an id that was never held (fresh store, already released, wrong id) is a clean
+    /// no-op decline, not a crash.
+    @Test func finishWarmWithNoHeldWarmIsUncacheable() throws {
+        let coord = PromptCacheCoordinator(store: try makeStore(Fixture.tempDir()))
+        let out = coord.finishWarm(WarmStore(), id: UUID(), model: twoLayerModel())
+        guard case let .uncacheable(reason) = out else {
+            Issue.record("expected .uncacheable, got \(out)"); return
+        }
+        #expect(reason == "no warm held for id")
     }
 
     @Test func releaseAllDropsEverything() throws {

@@ -41,6 +41,8 @@ struct Options {
     /// Simulate a smaller machine by holding anonymous memory, so the page cache cannot absorb
     /// every snapshot. 0 = no ballast.
     var freeRamBytes = 0
+    /// A config.json path or HF model id — print KV-cache economics and exit, no weights loaded.
+    var predictArgs: [String] = []
 
     static func parse() -> Options {
         var o = Options()
@@ -56,18 +58,23 @@ struct Options {
             case "--no-canary": o.skipCanary = true
             case "--free-ram":
                 o.freeRamBytes = (it.next().flatMap { Int($0) } ?? 0) * 1_000_000_000
+            case "--predict":
+                while let v = it.next() { o.predictArgs.append(v) }   // consumes the rest
             case "--help", "-h":
                 print("""
                 MLXPromptCacheBench — warm-loop I/O proof harness
 
-                  --model <35B|9B|1.7B>   run one model (default: all three, one at a time)
+                  --model <35B|9B|1.7B|GLM-32B>   run one model (default: all, one at a time)
                   --tokens N              prefix length to warm (default 16384)
                                           use 183296 to reproduce the production measurement
                   --resumes R             number of pause/resume rounds (default 8)
                   --json <path>           write the machine-readable artifact
                   --no-canary             skip the process-global eval-lock probe
-                  --free-ram G            simulate a G-gigabyte machine by holding ballast memory,
-                                          so page cache cannot absorb every snapshot
+                  --free-ram G            simulate a G-gigabyte machine by holding ballast memory
+                  --predict <cfg|id>...   print KV-cache economics from config.json — NO weights
+                                          loaded, NO GPU. Screen a candidate before pulling it.
+                                          Accepts config.json paths or HF model ids (resolved from
+                                          the local cache). Consumes all trailing arguments.
                 """)
                 exit(0)
             default: print("unknown argument \(a) — try --help"); exit(2)
@@ -79,6 +86,40 @@ struct Options {
 
 let opts = Options.parse()
 let blockSize = 256
+
+// MARK: - Predict mode (config-only, no MLX)
+
+if !opts.predictArgs.isEmpty {
+    func fmtG(_ b: Int) -> String { String(format: "%.2f GB", Double(b) / 1e9) }
+    print("═══ KV-cache economics (from config.json — no weights loaded) ═══")
+    print("KV dtype assumed fp16/bf16 = 2 bytes/element (weight quant does NOT change this).\n")
+    for arg in opts.predictArgs {
+        guard let p = ConfigPrediction.load(arg) else {
+            print("  ✗ \(arg): no readable config.json (not a file, and not in the HF cache)\n")
+            continue
+        }
+        let split = p.isHybrid
+            ? "\(p.attentionLayers) attention + \(p.linearLayers) linear of \(p.totalLayers)"
+            : "\(p.totalLayers) attention (dense)"
+        print("  \(arg)  [\(p.modelType)]")
+        print("    layers: \(split) · kv_heads \(p.kvHeads) · head_dim \(p.headDim) · context \(p.maxContext)"
+            + (p.slidingWindow.map { " · SWA window \($0)" } ?? ""))
+        print("    A = \(p.perTokenBytes) B/tok (\(String(format: "%.1f", Double(p.perTokenBytes) / 1024)) KiB/tok)"
+            + "   M = \(p.fixedBytes > 0 ? fmtG(p.fixedBytes) : "0")\(p.isHybrid ? "  (SSM term; conv adds a few %)" : "")")
+        let ladder = [8_192, 32_768, 131_072, 262_144, 524_288].filter { $0 <= max(p.maxContext, 8_192) }
+        let cells = ladder.map { "\($0 / 1024)K→\(fmtG(p.snapshotBytes($0)))" }.joined(separator: " · ")
+        print("    snapshot: \(cells)")
+        if p.slidingWindow != nil {
+            print("    note: sliding-window layers use RotatingKVCache in MLXPromptCache — cold-only (no RAM tier, no sub-slice)")
+        } else if p.isHybrid {
+            print("    note: hybrid — RAM tier stays cold-only; reusable only at a captured boundary")
+        } else {
+            print("    note: dense full-attention — RAM hot tier eligible, freely sub-sliceable")
+        }
+        print("")
+    }
+    exit(0)
+}
 
 // MARK: - Report model
 

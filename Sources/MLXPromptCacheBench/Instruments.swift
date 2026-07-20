@@ -175,9 +175,11 @@ enum StoreEvent: Sendable, Equatable {
         case ("record:", "saved"):
             guard t.count >= 3, let b = Int(t[2]) else { return .other }
             return .saved(bytes: b, file: t.count >= 6 ? t[5] : "?")
-        case ("reuse:", "loaded"):
+        case ("reuse:", "loaded"):                                  // legacy whole-snapshot load
             guard t.count >= 3 else { return .other }
             return .loaded(file: t[2])
+        case ("reuse:", "reassembled"):                             // delta chain reassembly = one load
+            return .loaded(file: "chain")
         case ("record:", "SKIP"): return .skip(line)
         case ("record:", "NOTHING"): return .nothingStored(line)
         default: return .other

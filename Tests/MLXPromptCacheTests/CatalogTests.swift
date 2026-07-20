@@ -5,7 +5,9 @@ import Testing
 @Suite struct CatalogTests {
     let bs = 4
     let sig = Fixture.signature
-    func emptyCatalog() -> Catalog { Catalog(header: .init(signature: sig, blockSize: bs)) }
+    func emptyCatalog() -> Catalog {
+        Catalog(header: .init(signature: sig, blockSize: bs, indexLayout: Catalog.currentIndexLayout))
+    }
     func hashes(_ tokens: [Int]) -> [BlockHash] { BlockHasher.boundaries(for: tokens, blockSize: bs, signature: sig) }
     
     @Test func emptyLookupMisses() {
@@ -17,7 +19,7 @@ import Testing
     @Test func recordThenExactHit() {
         var cat = emptyCatalog()
         let toks = Fixture.tokens(8)
-        let plan = cat.planRecord(hashes(toks), blockSize: bs)!
+        let plan = cat.planRecord(hashes(toks), blockSize: bs, delta: false)!
         _ = cat.commit(plan, byteSize: 1000, budgetBytes: 1_000_000)
         let hit = cat.lookup(hashes(toks))
         #expect(hit?.matchedTokens == 8)
@@ -26,7 +28,7 @@ import Testing
     
     @Test func crossPromptPartialMatch() {
         var cat = emptyCatalog()
-        let aPlan = cat.planRecord(hashes([1, 2, 3, 4, 5, 6, 7, 8]), blockSize: bs)!
+        let aPlan = cat.planRecord(hashes([1, 2, 3, 4, 5, 6, 7, 8]), blockSize: bs, delta: false)!
         _ = cat.commit(aPlan, byteSize: 1000, budgetBytes: 1_000_000)
         let hit = cat.lookup(hashes([1, 2, 3, 4, 9, 9, 9, 9]))
         #expect(hit?.matchedTokens == 4)
@@ -36,14 +38,14 @@ import Testing
     @Test func planRecordSkipsFullyCached() {
         var cat = emptyCatalog()
         let toks = Fixture.tokens(8)
-        _ = cat.commit(cat.planRecord(hashes(toks), blockSize: bs)!, byteSize: 1000, budgetBytes: 1_000_000)
-        #expect(cat.planRecord(hashes(toks), blockSize: bs) == nil)
+        _ = cat.commit(cat.planRecord(hashes(toks), blockSize: bs, delta: false)!, byteSize: 1000, budgetBytes: 1_000_000)
+        #expect(cat.planRecord(hashes(toks), blockSize: bs, delta: false) == nil)
     }
     
     @Test func evictUntilBudget() {
         var cat = emptyCatalog()
         for seed in [0, 100, 200] {
-            let p = cat.planRecord(hashes(Fixture.tokens(8, seed: seed)), blockSize: bs)!
+            let p = cat.planRecord(hashes(Fixture.tokens(8, seed: seed)), blockSize: bs, delta: false)!
             _ = cat.commit(p, byteSize: 1000, budgetBytes: 2500)
         }
         #expect(cat.totalBytes <= 2500)
@@ -53,11 +55,11 @@ import Testing
     @Test func lookupTouchPromotes() {
         var cat = emptyCatalog()
         let a = Fixture.tokens(8, seed: 0), b = Fixture.tokens(8, seed: 100)
-        _ = cat.commit(cat.planRecord(hashes(a), blockSize: bs)!, byteSize: 1000, budgetBytes: 2500)
-        let bPlan = cat.planRecord(hashes(b), blockSize: bs)!
+        _ = cat.commit(cat.planRecord(hashes(a), blockSize: bs, delta: false)!, byteSize: 1000, budgetBytes: 2500)
+        let bPlan = cat.planRecord(hashes(b), blockSize: bs, delta: false)!
         _ = cat.commit(bPlan, byteSize: 1000, budgetBytes: 2500)
         _ = cat.lookup(hashes(a))
-        let cPlan = cat.planRecord(hashes(Fixture.tokens(8, seed: 200)), blockSize: bs)!
+        let cPlan = cat.planRecord(hashes(Fixture.tokens(8, seed: 200)), blockSize: bs, delta: false)!
         let evicted = cat.commit(cPlan, byteSize: 1000, budgetBytes: 2500)
         #expect(evicted == [bPlan.fileName])
         #expect(cat.lookup(hashes(a)) != nil)
@@ -65,9 +67,9 @@ import Testing
     
     @Test func ownershipOrphanEviction() {
         var cat = emptyCatalog()
-        let aPlan = cat.planRecord(hashes(Fixture.tokens(8)),  blockSize: bs)!
+        let aPlan = cat.planRecord(hashes(Fixture.tokens(8)), blockSize: bs, delta: false)!
         _ = cat.commit(aPlan, byteSize: 1000, budgetBytes: 1_000_000)
-        let bPlan = cat.planRecord(hashes(Fixture.tokens(12)), blockSize: bs)!
+        let bPlan = cat.planRecord(hashes(Fixture.tokens(12)), blockSize: bs, delta: false)!
         let evicted = cat.commit(bPlan, byteSize: 1000, budgetBytes: 1_000_000)
         #expect(evicted == [aPlan.fileName])
         #expect(cat.lookup(hashes(Fixture.tokens(8)))?.fileName == bPlan.fileName)
@@ -77,7 +79,7 @@ import Testing
     @Test func codableRoundTrip() throws {
         var cat = emptyCatalog()
         let toks = Fixture.tokens(8)
-        _ = cat.commit(cat.planRecord(hashes(toks), blockSize: bs)!, byteSize: 1000, budgetBytes: 1_000_000)
+        _ = cat.commit(cat.planRecord(hashes(toks), blockSize: bs, delta: false)!, byteSize: 1000, budgetBytes: 1_000_000)
         var restored = try JSONDecoder().decode(Catalog.self, from: try JSONEncoder().encode(cat))
         #expect(restored.lookup(hashes(toks))?.matchedTokens == 8)
         #expect(restored.totalBytes == cat.totalBytes)
@@ -88,7 +90,7 @@ import Testing
     @Test func probeDoesNotBumpClockOrLastAccess() {
         var cat = emptyCatalog()
         let toks = Fixture.tokens(8)
-        let plan = cat.planRecord(hashes(toks), blockSize: bs)!
+        let plan = cat.planRecord(hashes(toks), blockSize: bs, delta: false)!
         _ = cat.commit(plan, byteSize: 100, budgetBytes: 1_000)
 
         let clockBefore = cat.clock
@@ -110,15 +112,15 @@ import Testing
         let b = hashes(Fixture.tokens(8, seed: 100))
         let c = hashes(Fixture.tokens(8, seed: 200))
 
-        let planA = cat.planRecord(a, blockSize: bs)!
+        let planA = cat.planRecord(a, blockSize: bs, delta: false)!
         _ = cat.commit(planA, byteSize: 100, budgetBytes: 1_000)        // A: lastAccess 1
-        _ = cat.commit(cat.planRecord(b, blockSize: bs)!, byteSize: 100, budgetBytes: 1_000)  // B: 2
+        _ = cat.commit(cat.planRecord(b, blockSize: bs, delta: false)!, byteSize: 100, budgetBytes: 1_000)  // B: 2
 
         _ = cat.probe(a); _ = cat.probe(a); _ = cat.probe(a)            // probe A hard
 
         // Committing C at a 250-byte budget (3 × 100 on disk) must evict exactly the LRU entry —
         // and that is still A, because probes left its lastAccess alone.
-        let evicted = cat.commit(cat.planRecord(c, blockSize: bs)!, byteSize: 100, budgetBytes: 250)
+        let evicted = cat.commit(cat.planRecord(c, blockSize: bs, delta: false)!, byteSize: 100, budgetBytes: 250)
         #expect(evicted == [planA.fileName])
     }
 }

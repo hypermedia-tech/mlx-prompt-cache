@@ -60,10 +60,91 @@ struct ModelSpec: Sendable {
         linearLayers: 0, valueHeads: 0, keyHeadDim: 0, valueHeadDim: 0,
         maxContext: 40_960)
 
-    static let all = [qwen35B, qwen9B, qwen17B]
+    // GLM-4-32B: dense pure-attention transformer, ~same parameter scale as the 35B hybrid — the
+    // controlled comparison. 61 uniform KVCacheSimple layers (glm4 conforms to
+    // KVCacheDimensionProvider with no newCache override). partial_rotary_factor 0.5 rotates half the
+    // head dims but the cache still stores full head_dim=128, so A ignores it; G1 confirms empirically.
+    // Predicted A = 61 × 2 × 2 × 128 × 2 = 62,464 B/tok (61.0 KiB) — 3.05× the hybrid's 20 KiB/tok at
+    // equal scale, and M = 0. Context is only 32,768, so compare both at ≤24,576 tokens.
+    static let glm32B = ModelSpec(
+        id: "mlx-community/GLM-4-32B-0414-4bit", short: "GLM-32B",
+        layers: 61, attentionLayers: 61, kvHeads: 2, headDim: 128,
+        linearLayers: 0, valueHeads: 0, keyHeadDim: 0, valueHeadDim: 0,
+        maxContext: 32_768)
+
+    static let all = [qwen35B, qwen9B, qwen17B, glm32B]
 
     static func named(_ s: String) -> ModelSpec? {
         all.first { $0.short.lowercased() == s.lowercased() || $0.id == s }
+    }
+}
+
+// MARK: - Config-driven prediction (no weights, no GPU)
+
+/// The KV-cache byte model computed straight from a model's `config.json`, so any candidate can be
+/// screened for cache cost before its weights are pulled. Same A/M formula the G1 gate validates to
+/// 0.00% on loaded models — this is that formula, decoupled from a hardcoded `ModelSpec`.
+struct ConfigPrediction {
+    let source: String
+    let modelType: String
+    let totalLayers: Int
+    let attentionLayers: Int
+    let linearLayers: Int
+    let kvHeads: Int
+    let headDim: Int
+    let maxContext: Int
+    let slidingWindow: Int?
+    let recurrentStateBytes: Int   // per-linear-layer SSM term (fp32); 0 for non-hybrids
+    let kvDtypeBytes: Int
+
+    var isHybrid: Bool { linearLayers > 0 }
+    /// Per-token attention KV cost. KV is fp16/bf16 = 2 bytes REGARDLESS of weight quantization —
+    /// a 4-bit model still holds a 2-byte KV cache.
+    var perTokenBytes: Int { attentionLayers * 2 * kvHeads * headDim * kvDtypeBytes }
+    var fixedBytes: Int { linearLayers * recurrentStateBytes }
+    func snapshotBytes(_ n: Int) -> Int { perTokenBytes * n + fixedBytes }
+
+    /// Load from a `config.json` path, or from a HuggingFace model id resolved against the local cache.
+    static func load(_ arg: String) -> ConfigPrediction? {
+        let path = FileManager.default.fileExists(atPath: arg) ? arg : hfCachePath(forModelID: arg)
+        guard let path,
+              let data = FileManager.default.contents(atPath: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        // Multimodal configs nest the language fields under text_config.
+        let c = (root["text_config"] as? [String: Any]) ?? root
+        func int(_ k: String) -> Int? { (c[k] as? NSNumber)?.intValue }
+        let layers = int("num_hidden_layers") ?? 0
+        let heads = int("num_attention_heads") ?? 0
+        let hidden = int("hidden_size") ?? 0
+        let kvHeads = int("num_key_value_heads") ?? heads                 // absent ⇒ MHA
+        let headDim = int("head_dim") ?? (heads > 0 ? hidden / heads : 0)
+        let types = c["layer_types"] as? [String]                        // hybrid split, Qwen3.5/3.6 style
+        let attn = types?.filter { $0 == "full_attention" }.count ?? layers
+        let linear = types?.filter { $0 == "linear_attention" }.count ?? 0
+        let recur = (int("linear_num_value_heads") ?? 0)
+            * (int("linear_key_head_dim") ?? 0) * (int("linear_value_head_dim") ?? 0) * 4
+        return ConfigPrediction(
+            source: path, modelType: (c["model_type"] as? String) ?? "?",
+            totalLayers: layers, attentionLayers: attn, linearLayers: linear,
+            kvHeads: kvHeads, headDim: headDim,
+            maxContext: int("max_position_embeddings") ?? 0,
+            slidingWindow: int("sliding_window"),
+            recurrentStateBytes: recur, kvDtypeBytes: 2)
+    }
+
+    /// `~/.cache/huggingface/hub/models--org--name/snapshots/<hash>/config.json`
+    static func hfCachePath(forModelID id: String) -> String? {
+        let hub = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+            .appendingPathComponent("models--" + id.replacingOccurrences(of: "/", with: "--"), isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+        guard let snaps = try? FileManager.default.contentsOfDirectory(
+            at: hub, includingPropertiesForKeys: nil) else { return nil }
+        for snap in snaps {
+            let cfg = snap.appendingPathComponent("config.json")
+            if FileManager.default.fileExists(atPath: cfg.path) { return cfg.path }
+        }
+        return nil
     }
 }
 

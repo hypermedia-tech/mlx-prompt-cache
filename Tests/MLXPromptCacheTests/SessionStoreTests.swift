@@ -140,7 +140,7 @@ struct SessionStoreTests {
         let id = UUID()
         let (_, cache) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(30),
             warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
-        #expect(!cache.isEmpty)
+        #expect(cache.isEmpty == false)
         sessions.release(id)
         var reseeded = false
         let (_, cache2) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(10),
@@ -148,5 +148,33 @@ struct SessionStoreTests {
         #expect(reseeded)                                                                 // entry was dropped → makeCache ran
         #expect(PromptCacheIO.tokenLength(cache2) == 0)                                    // brand-new empty cache
         sessions.release(id); sessions.release(id)                                        // idempotent — no crash
+    }
+
+    // 8 — the PUBLIC coordinator seam: `advance` wires the disk root into the seed and `release` frees.
+    //     The tests above drive `SessionStore.advance` directly; this exercises the consumer-facing door.
+    @Test func coordinatorAdvanceSeedsFromRootAndReleaseFrees() throws {
+        let (_, store, coord) = try makeStore()
+        let root = Fixture.tokens(600)                                                     // boundary 512
+        guard case .complete = coord.warm(promptTokens: root, model: twoLayerModel(),
+                                          parameters: GenerateParameters())
+        else { Issue.record("warm did not complete"); return }
+        let sessions = SessionStore()
+        let id = UUID()
+
+        let (delta, cache) = coord.advance(sessions, id: id,
+                                           fullPromptTokens: Fixture.tokens(512 + 20),
+                                           rootTokens: root, model: twoLayerModel(),
+                                           parameters: GenerateParameters())
+        #expect(PromptCacheIO.tokenLength(cache) == 512)                                   // seeded from the durable root
+        #expect((delta.text.tokens.shape.last ?? 0) == 20)                                // only the new turn
+
+        coord.release(sessions, id: id)
+        // After release the entry is gone, so the next advance re-seeds from the root rather than resuming.
+        var reseeded = false
+        let (_, cache2) = sessions.advance(id: id, fullPromptTokens: root,
+            warmRoot: { reseeded = true; return store.reuse(forTokens: root) },
+            makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        #expect(reseeded)                                                                  // release dropped the live entry
+        #expect(PromptCacheIO.tokenLength(cache2) == 512)
     }
 }

@@ -57,36 +57,46 @@ public final class PromptCacheStore: Sendable {
             return Reused(cache: HotCodec.reconstruct(entry.blobs), matchedTokens: hit.matchedTokens)
         }
 
-        // Cold: load the whole snapshot (private buffers).
-        let url = directory.appendingPathComponent(hit.fileName)
-        guard let full = PromptCacheIO.loadFull(url: url, signature: signature),
+        // Cold: chain the delta files (or the single legacy snapshot) and reassemble private buffers.
+        // `chain` stops at the first hole, so `effectiveMatch` may be shorter than `hit.matchedTokens`
+        // if a mid-chain file was budget-evicted. Touch the WHOLE chain (not just the deepest file) so
+        // the next eviction can't drop an early file and orphan everything after it.
+        let links = catalog.withLock { cat -> [Catalog.ChainLink] in
+            let l = cat.chain(hashes); cat.touch(l.map { $0.fileName }); return l
+        }
+        let effectiveMatch = links.last?.tokenCount ?? 0
+        let urls = links.map { directory.appendingPathComponent($0.fileName) }
+        guard effectiveMatch > 0,
+              let full = PromptCacheIO.reassemble(urls, signature: signature),
               let fullTokens = PromptCacheIO.tokenLength(full) else {
-            // Self-heal: the catalog points at a snapshot that's gone or corrupt (e.g. deleted out-of-band
-            // while live). Evict the dead entry, rewrite the index, and drop it from the hot tier, so the
-            // next `record` re-stores it instead of being blocked by `planRecord` ("already in catalog").
+            // Self-heal: a file in the chain is gone/corrupt. Evict the deepest matched entry and drop
+            // it from hot, so the next `record` re-stores. `chain` recomputes from what survives.
             catalog.withLock { cat in
                 cat.evict(hit.fileName)
                 Self.writeIndex(cat, to: directory.appendingPathComponent("index.json"))
             }
             hot.withLock { $0.drop(hit.fileName) }
-            log("reuse: MISS — \(hit.fileName) missing/corrupt; evicted dead catalog entry (will re-record)")
+            log("reuse: MISS — chain for \(hit.fileName) (\(links.count) files) missing/corrupt; evicted (will re-record)")
             return nil
         }
-        log("reuse: loaded \(hit.fileName) — snapshot offset \(fullTokens)")
+        log("reuse: reassembled \(links.count) file\(links.count == 1 ? "" : "s") → \(fullTokens) tokens"
+            + (effectiveMatch < hit.matchedTokens ? " (chain HOLE — capped from \(hit.matchedTokens))" : ""))
 
-        if fullTokens == hit.matchedTokens {                       // full match → promote bytes + vend the load
-            if let blobs = HotCodec.extract(full) {
-                hot.withLock { $0.insert(hit.fileName, blobs: blobs, fullTokens: fullTokens) }
+        if fullTokens == effectiveMatch {                          // full match (always so for a delta chain)
+            // Hot promote only for a SINGLE file — a multi-file chain has no one file that is the whole
+            // prefix, so it cannot be keyed into the file-name-addressed hot tier.
+            if links.count == 1, let blobs = HotCodec.extract(full) {
+                hot.withLock { $0.insert(links[0].fileName, blobs: blobs, fullTokens: fullTokens) }
             }
-            log("reuse: HIT (cold/disk, full) \(hit.matchedTokens) tokens")
-            return Reused(cache: full, matchedTokens: hit.matchedTokens)
-        } else {                                                   // partial → trim private cache, no hot
-            guard let trimmed = PromptCacheIO.trim(full, toMatched: hit.matchedTokens) else {
-                log("reuse: MISS — trim to \(hit.matchedTokens) failed (snapshot offset \(fullTokens), not trimmable?)")
+            log("reuse: HIT (cold/disk, full) \(effectiveMatch) tokens")
+            return Reused(cache: full, matchedTokens: effectiveMatch)
+        } else {                                                   // partial → trim (single legacy file only)
+            guard let trimmed = PromptCacheIO.trim(full, toMatched: effectiveMatch) else {
+                log("reuse: MISS — trim to \(effectiveMatch) failed (offset \(fullTokens), not trimmable?)")
                 return nil
             }
-            log("reuse: HIT (cold/disk, partial) \(hit.matchedTokens)/\(fullTokens) tokens")
-            return Reused(cache: trimmed, matchedTokens: hit.matchedTokens)
+            log("reuse: HIT (cold/disk, partial) \(effectiveMatch)/\(fullTokens) tokens")
+            return Reused(cache: trimmed, matchedTokens: effectiveMatch)
         }
     }
 
@@ -134,11 +144,12 @@ public final class PromptCacheStore: Sendable {
         let types = Set(cache.map { String(describing: type(of: $0)) }).sorted().joined(separator: ", ")
         log("record: \(prefixTokens.count) tokens → \(hashes.count) full \(blockSize)-blocks; live cache = \(cache.count) layers, attnLen=\(PromptCacheIO.tokenLength(cache).map { "\($0)" } ?? "none"), sliceable=\(PromptCacheIO.isSliceable(cache)), types=[\(types)]")
 
-        guard let plan = catalog.withLock({ $0.planRecord(hashes, blockSize: blockSize) }) else {
+        let delta = PromptCacheIO.canDelta(cache)
+        guard let plan = catalog.withLock({ $0.planRecord(hashes, blockSize: blockSize, delta: delta) }) else {
             log("record: NOTHING STORED — planRecord returned nil (\(hashes.isEmpty ? "0 full blocks: prompt < \(blockSize) tokens" : "all \(hashes.count) blocks already in catalog"))")
             return
         }
-        log("record: plan \(plan.fileName) — \(plan.boundaries.count) boundaries, up to \(plan.boundaries.last?.tokenCount ?? 0) tokens")
+        log("record: plan \(plan.delta ? "DELTA range [\(plan.fromToken),\(plan.toToken))" : "WHOLE up to \(plan.boundaries.last?.tokenCount ?? 0)") — \(plan.boundaries.count) new boundaries → \(plan.fileName)")
 
         // Recreate the directory if it was deleted out-of-band (e.g. a live `rm -rf`) — otherwise
         // `savePromptCache` fails to open the file. Completes the self-heal alongside the catalog evict.
@@ -146,7 +157,12 @@ public final class PromptCacheStore: Sendable {
         let url = directory.appendingPathComponent(plan.fileName)
         let bytes: Int
         do {
-            bytes = try PromptCacheIO.save(prefixTokenCount: prefixTokens.count, liveCache: cache, url: url, signature: signature)
+            if plan.delta {
+                bytes = try PromptCacheIO.saveDelta(from: plan.fromToken, to: plan.toToken,
+                                                    liveCache: cache, url: url, signature: signature)
+            } else {
+                bytes = try PromptCacheIO.save(prefixTokenCount: prefixTokens.count, liveCache: cache, url: url, signature: signature)
+            }
         } catch PromptCacheIO.Failure.hybridNotAtBoundary {
             // Hybrid model (recurrent Mamba/SSM layers): the post-generation cache carries the generated
             // tokens and can't be trimmed back to the prompt. Caching it needs a boundary capture (preload),
