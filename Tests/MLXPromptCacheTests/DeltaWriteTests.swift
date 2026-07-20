@@ -105,6 +105,45 @@ import Testing
         #expect(stateBytesEqual(reused?.cache ?? [], live))          // reassembled == source
     }
 
+    /// The HYBRID disk-reassembly proof (the gap the bench's G4 doesn't cover — G4 tests the RAM-held
+    /// cache, this tests reuse reassembled FROM DISK). A hybrid recorded in two delta persists, then
+    /// reused, must: concatenate the attention slices correctly AND carry the DEEPEST file's recurrent
+    /// (Mamba) state — not the shallower one. Built with a real, non-empty Mamba state so the recurrent
+    /// path is actually exercised.
+    @Test func hybridDeltaReassemblyPreservesRecurrent() throws {
+        let dir = Fixture.tempDir()
+        let store = try PromptCacheStore(directory: dir, budgetBytes: 1 << 34, signature: sig, blockSize: 256)
+        let tokens = Fixture.tokens(1024)
+        let kvHeads = 2, headDim = 8
+        // One shared 1024-token attention tensor, sliced for both persists ⇒ the 512-prefix is a
+        // genuine prefix of the 1024 cache (byte-consistent), exactly as an incremental warm produces.
+        func pat(_ mult: Int) -> MLXArray {
+            MLXArray((0 ..< kvHeads * 1024 * headDim).map { Float(($0 * mult + 1) % 251) })
+                .reshaped([1, kvHeads, 1024, headDim]).asType(.bfloat16)
+        }
+        let keys = pat(7), vals = pat(13)
+        func mamba(_ seed: Float) -> MambaCache {
+            let m = MambaCache()
+            let conv = MLXArray((0 ..< 32).map { Float(Int($0) % 251) + seed }).reshaped([1, 4, 8]).asType(.bfloat16)
+            let ssm = MLXArray((0 ..< 64).map { Float(Int($0) % 251) + seed }).reshaped([1, 4, 4, 4]).asType(.bfloat16)
+            m.state = [conv, ssm]
+            return m
+        }
+        func hybrid(upTo n: Int, mambaSeed: Float) -> [KVCache] {
+            let a = KVCacheSimple()
+            a.state = [keys[.ellipsis, ..<n, 0...], vals[.ellipsis, ..<n, 0...]]   // offset == n
+            return [mamba(mambaSeed), a]                                          // MambaCache first (hybrid layout)
+        }
+        let c512 = hybrid(upTo: 512, mambaSeed: 5)                                // Mamba @512
+        let c1024 = hybrid(upTo: 1024, mambaSeed: 10)                             // Mamba @1024 — must win
+        try store.record(prefixTokens: Array(tokens.prefix(512)), cache: c512)
+        try store.record(prefixTokens: tokens, cache: c1024)
+        let reused = store.reuse(forTokens: tokens)
+        #expect(reused?.matchedTokens == 1024)
+        // Attention concatenated to 1024 AND the DEEPEST (mambaSeed 10) recurrent state — i.e. == c1024.
+        #expect(stateBytesEqual(reused?.cache ?? [], c1024))
+    }
+
     /// The amplification proof: the second persist writes only its DELTA (~512 tokens), and the first
     /// file is NOT deleted. Two files retained; the second is far smaller than a whole 1024-token
     /// snapshot would be (which the old path wrote and then orphaned the first).

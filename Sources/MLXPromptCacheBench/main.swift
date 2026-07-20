@@ -565,18 +565,15 @@ for spec in opts.models {
     for s in sq.samples {
         print("    r\(pad("\(s.round)", 3)) reached=\(pad("\(s.reachedTokens)", 7)) write=\(pad(fmtBytes(s.logicalWriteBytes), 10)) read=\(pad(fmtBytes(s.logicalReadBytes), 10)) wall=\(pad(fmtMs(s.wallMs), 9)) fsync=\(pad(fmtMs(s.fsyncMs), 8)) devW=\(fmtBytes(s.deviceWriteBytes)) devR=\(fmtBytes(s.deviceReadBytes))")
     }
-    // Free full-scale validation of the byte model: G2's final snapshot IS bytes(boundary), so no
-    // extra prefill is needed to confirm the fit extrapolates to production scale.
-    if let last = sq.samples.last, last.logicalWriteBytes > 0 {
-        let predicted = Double(spec.predictedA * last.reachedTokens) + rep.measuredM
-        let err = abs(Double(last.logicalWriteBytes) - predicted) / predicted
-        print(String(format: "    full-scale check: snapshot at %d tokens = %@, model predicts %@ (%+.3f%%)",
-                     last.reachedTokens, fmtBytes(last.logicalWriteBytes),
-                     fmtBytes(Int(predicted)), err * 100))
-        rep.gates.append(gate("G2.modelAtScale", err < 0.01,
-                              String(format: "byte model holds at %d tokens (%+.3f%%)",
-                                     last.reachedTokens, err * 100)))
-    }
+    // With delta writes, each status-quo resume writes only its NEW range — the per-resume `write`
+    // column is a delta, not a whole snapshot, so it can't be checked against a whole-snapshot
+    // prediction here. The whole-snapshot byte-model check moves to after G3, using the residency
+    // arm's single full-prefix snapshot (see `G0.modelAtScale`).
+    let writeRounds = sq.samples.filter { $0.logicalWriteBytes > 0 }.count
+    print("    delta writes: attention written once (~\(fmtBytes(spec.predictedA * boundary)))"
+        + (spec.isHybrid
+           ? " + \(writeRounds)× recurrent (~\(fmtBytes(Int(rep.measuredM))) each = \(fmtBytes(writeRounds * Int(rep.measuredM))) — the hybrid per-checkpoint tax, intrinsic)"
+           : " ⇒ ideal, no recurrent tax"))
     let sqRoundTrip = sq.totalLogicalWrite + sq.totalLogicalRead
     print("    TOTAL logical write \(fmtBytes(sq.totalLogicalWrite)) + read \(fmtBytes(sq.totalLogicalRead)) = \(fmtBytes(sqRoundTrip))")
     print("    TOTAL device  write \(fmtBytes(sq.totalDeviceWrite)) + read \(fmtBytes(sq.totalDeviceRead))")
@@ -629,6 +626,16 @@ for spec in opts.models {
     rep.gates.append(gate("G3.linear",
                           res.totalLogicalWrite <= Int(Double(spec.predictedBytes(boundary)) * 1.05),
                           "residency total write ≈ one snapshot"))
+    // Byte model at full scale, off the residency arm's single WHOLE-prefix snapshot (the status-quo
+    // arm no longer produces one — it writes deltas). snapshot(boundary) = A·boundary + M.
+    if let snap = res.samples.map(\.logicalWriteBytes).max(), snap > 0 {
+        let predicted = Double(spec.predictedA * boundary) + rep.measuredM
+        let err = abs(Double(snap) - predicted) / predicted
+        print(String(format: "    full-scale check: whole snapshot at %d tokens = %@, model predicts %@ (%+.3f%%)",
+                     boundary, fmtBytes(snap), fmtBytes(Int(predicted)), err * 100))
+        rep.gates.append(gate("G0.modelAtScale", err < 0.01,
+                              String(format: "byte model holds at %d tokens (%+.3f%%)", boundary, err * 100)))
+    }
 
     // ── G4 · losslessness ───────────────────────────────────────────────────────────────────
     print("\n  ── G4 losslessness ──")
