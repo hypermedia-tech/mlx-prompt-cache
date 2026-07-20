@@ -74,8 +74,10 @@ public final class WarmStore: @unchecked Sendable {
         live[id]?.persistedTokens = tokens
     }
 
-    /// Ids whose resident bytes exceed `budgetBytes`, coldest-held first. Empty when unbounded or
-    /// under budget. The coordinator persists each victim before releasing it.
+    /// Ids to evict when resident bytes exceed `budgetBytes`, **largest first**. `WarmStore` tracks
+    /// no recency, so this is a size-based policy, not an LRU — it frees the most memory in the
+    /// fewest evictions. Empty when unbounded or under budget. Nothing is discarded: the coordinator
+    /// persists each victim before releasing it.
     package func victimsOverBudget(excluding keep: UUID) -> [UUID] {
         guard budgetBytes > 0, residentBytes > budgetBytes else { return [] }
         var over = residentBytes - budgetBytes

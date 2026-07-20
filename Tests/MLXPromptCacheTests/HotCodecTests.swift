@@ -61,6 +61,16 @@ import Testing
         // RotatingKVCache is neither KVCacheSimple nor QuantizedKVCache ⇒ not hot-cacheable (stays cold).
         #expect(HotCodec.extract([RotatingKVCache(maxSize: 16)]) == nil)
     }
+
+    @Test func chunkedCacheReturnsNilNotCrash() {
+        // ChunkedKVCache SUBCLASSES KVCacheSimple, so without the explicit guard it would be tagged
+        // "KVCacheSimple", then `reconstruct` would set its 2-element metaState on a plain
+        // KVCacheSimple — whose BaseKVCache setter fatalErrors (always active). extract must decline
+        // it (stay cold) instead. Guards HotCodec.swift's ChunkedKVCache branch against a reorder.
+        #expect(HotCodec.extract([Fixture.chunkedCache(tokens: 8)]) == nil)
+        // And a hybrid attention+chunked cache: one unsupported layer declines the whole extraction.
+        #expect(HotCodec.extract(Fixture.attentionPlusChunked(slice: 8)) == nil)
+    }
     
     @Test func roundTripPreservesNonZeroBytes() {
         let original = Fixture.patternedCache(tokens: 8)

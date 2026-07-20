@@ -28,6 +28,7 @@ If every prompt is unique end to end, there's no shared prefix to reuse and this
 - **Block hashing.** Tokens are split into fixed-size blocks (default 256). Each block gets a *chained* SHA-256 digest: `hash(blockₙ) = SHA256(signature ++ hash(blockₙ₋₁) ++ tokens)`. A shared prefix produces identical leading hashes; any divergence only affects the blocks after it.
 - **Signature gating.** A `CacheSignature` (model id + KV dtype + KV bits + build version) is folded into every hash *and* re-checked against snapshot metadata on load — so a cache is only ever reused for the exact model and quantization that produced it.
 - **Two tiers, both LRU.** A `Codable` catalog maps block hashes → on-disk snapshots (the **cold/SSD tier**, bounded by `budgetBytes`). With `hotBudgetBytes > 0`, recently used snapshots are also held as raw bytes in an in-RAM **hot tier**; a repeat hit is reconstructed from RAM with no disk read. The hot tier is a strict accelerator — every resident snapshot also exists on disk, so RAM eviction is always lossless.
+- **The RAM tier is attention-only by construction.** It serialises `KVCacheSimple` and `QuantizedKVCache` layers; any other layer type makes extraction decline, so **hybrid (Mamba/SSM) models never populate it** whatever `hotBudgetBytes` is set to — they are served from the SSD tier alone. This is deliberate: on a hybrid the recurrent state is a small, fixed fraction of the snapshot and the OS page cache already serves the re-read from RAM, so a dedicated RAM tier would hold gigabytes to save only a deserialize step. (A single-sequence recurrent layer *can* be rebuilt from bytes via the public cache API; the general batched/left-padded case cannot, without reaching into the MLX module. The tier stays attention-only for the cost reason, not the reconstruction one.)
 
 Reuse is **block-aligned**: only whole blocks are reusable, and the trailing partial block is always re-prefilled.
 
@@ -45,7 +46,7 @@ Add the package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/hypermedia-tech/mlx-prompt-cache", from: "0.1.0"),
+    .package(url: "https://github.com/hypermedia-tech/mlx-prompt-cache", from: "0.5.0"),
 ],
 targets: [
     .target(
@@ -128,9 +129,69 @@ A complete, runnable end-to-end example — load a model, cold vs. warm, verify 
 - **`Reused { cache: [KVCache]; matchedTokens: Int }`** — the recovered cache and how many leading tokens it covers.
 - **`CacheSignature(modelId:kvDType:kvBits:buildVersion:)`** — invalidation key; reuse is gated on an exact match.
 
+### Background warming (`WarmStore`)
+
+Warming a long document in the background means yielding to interactive work and resuming later.
+`warm(_:id:…)` **holds the live cache between yields**, so a resume neither reloads the prefix nor
+rewrites it.
+
+```swift
+let warms = WarmStore(budgetBytes: 8 << 30)   // hold one; app lifetime
+let fileID = UUID()                           // one per document being warmed
+
+try await modelContainer.perform { context in
+    let outcome = coordinator.warm(
+        warms, id: fileID,
+        promptTokens: documentTokens,
+        model: context.model,
+        parameters: params,
+        persist: .onCompletion,               // one write, at the end — not on every yield
+        shouldPause: { interactiveWorkIsWaiting() }
+    )
+    // .paused  → cache is held; call again with the same id to resume
+    // .complete → snapshot written, cache released
+}
+
+// Giving up on a document (tab closed, user moved on): keep the work, free the memory.
+try await modelContainer.perform { context in
+    coordinator.finishWarm(warms, id: fileID, model: context.model)
+}
+```
+
+Without residency, every yield writes the whole prefix and every resume reads it back. Warming one
+183k-token document across 17 yields wrote **38.6 GB**; with residency it writes **3.8 GB** — the
+same snapshot, produced once. Each of those writes also holds MLX's process-global evaluation lock,
+measured at up to **8.5 s** at that prefix length, which is exactly the interactive work the yield
+existed to let through.
+
+Residency is a strict accelerator. An id that is not resident — fresh process, released, evicted —
+falls back to the disk path unchanged. A held cache is only reused when the caller's tokens hash to
+the prefix it actually covers; on a mismatch it is declined rather than extended, so a stale or
+colliding id costs one re-prefill and can never record a snapshot under the wrong hash.
+
+Over `budgetBytes`, the largest other warms are persisted and then released — work is never dropped.
+`budgetBytes: 0` disables the cap.
+
+### API surface (coordinator)
+
+`PromptCacheCoordinator` is the door for everything that touches a live cache; the store's
+`reuse`/`record` remain available for direct use.
+
+- **`prepare(promptTokens:model:parameters:)`** — reuse the longest cached prefix or capture a fresh
+  one, returning a generation-ready cache and where to start. Handles attention vs hybrid itself.
+- **`warm(_:id:promptTokens:model:parameters:persist:shouldPause:)`** — resumable background warming
+  with residency (above).
+- **`finishWarm(_:id:model:)`** — persist a held warm and release it.
+- **`heldCache(_:id:model:)`** — the live cache for a held warm, to generate from without a round trip.
+- **`advance(_:id:fullPromptTokens:rootTokens:model:parameters:)`** — multi-turn conversations against
+  a `SessionStore`; the cache is extended in place across turns, never reloaded.
+- **`release(_:id:)`** — free a conversation's live cache.
+
 ### Threading
 
-`reuse`/`record`/`preload` are designed to run on the caller's thread inside `modelContainer.perform { … }`. The returned `[KVCache]` is **not** `Sendable` (it is GPU-backed); use it on the thread that received it and don't pass it across an isolation boundary. The store itself is `Sendable` and safe to share — its catalog and hot tier are `Sendable` value types behind mutexes, and all MLX/disk work runs outside the locks.
+`reuse`/`record`/`preload` are designed to run on the caller's thread inside `modelContainer.perform { … }`. The same holds for every coordinator call, and for `WarmStore`/`SessionStore`, whose live caches are only ever touched inside `perform`.
+
+**Drain generation streams inside the `perform` that created them.** `generateTokens` does not run in your closure — it boxes the cache and launches a detached task, and its `AsyncStream` is `Sendable`, so the compiler will let you return it and drain it outside. Doing that puts two live caches on MLX concurrently with no diagnostic. The returned `[KVCache]` is **not** `Sendable` (it is GPU-backed); use it on the thread that received it and don't pass it across an isolation boundary. The store itself is `Sendable` and safe to share — its catalog and hot tier are `Sendable` value types behind mutexes, and all MLX/disk work runs outside the locks.
 
 ## Correctness
 
@@ -139,7 +200,7 @@ Reuse must never change what the model produces. The integration harness verifie
 ## Performance
 
 ![TTFT](https://img.shields.io/badge/TTFT-up_to_233x_faster-2ea44f)
-![warm TTFT](https://img.shields.io/badge/warm_TTFT-under_160_ms-2ea44f)
+![warm TTFT](https://img.shields.io/badge/warm_TTFT-68–317_ms-2ea44f)
 ![reuse](https://img.shields.io/badge/reuse-byte--identical-1f6feb)
 ![verified on](https://img.shields.io/badge/verified_on-attention_and_hybrid-8957e5)
 
@@ -169,6 +230,11 @@ Cold (fresh prefill) → warm (reused prefix), at the smallest and largest conte
 - 📈 **The speedup scales with the shared prefix** — a single page saves little; a two-hour transcript or a large log dump saves nearly all of the prefill.
 - 🧬 **Hybrids win twice.** The Mamba/SSM state is fixed-size, so a hybrid model's snapshot *shrinks* per token as context grows — smaller on disk **and** faster to reload than the pure-attention model, whose flat 112 KiB/token cache is what lifts its warm TTFT at 24k.
 
+> **What "warm" measures:** the snapshot is written seconds earlier in the same process and is
+> resident in the OS page cache, so warm TTFT is deserialisation plus `eval` — not a device read.
+> That is the representative case for re-querying a document you just opened; a cold-from-SSD read
+> is the pessimistic path and is not measured here.
+>
 > Measured on an M4 Max (128 GB, macOS 26) under greedy decoding via the bundled `MLXPromptCacheScratch` harness — a *different* question over the same recorded context (100% of prefix blocks reused; only the ~20-token question suffix re-prefilled), with the `cold == warm == paused-then-resumed` byte-identity gate passing on every model, both pure-attention and hybrid (Mamba/SSM). One machine's numbers — reproduce your own with `swift run MLXPromptCacheScratch`.
 
 ## Limitations
@@ -176,6 +242,7 @@ Cold (fresh prefill) → warm (reused prefix), at the smallest and largest conte
 - **Block-aligned reuse** — the trailing partial block is always re-prefilled (default block size 256 tokens).
 - **Hot tier serves full-prefix matches.** A repeat query over the same recorded context is served from RAM; a *partial* cross-prompt match (sharing only a leading run of a longer snapshot) is served from disk. A hot hit reconstructs a fresh private cache from the resident bytes.
 - **Snapshots are large.** KV-cache for a long prefix can be hundreds of MB; both budgets are in bytes — size them accordingly. The RAM tier holds the same bytes the snapshot occupies on disk.
+- **Hybrid models are cold-only.** `hotBudgetBytes` has no effect on a model with `MambaCache` layers — the RAM tier is attention-only (see *How it works*). Two of the three models benchmarked below are hybrids.
 - **Sliding-window (rotating) caches are cold-only.** Models whose cache isn't uniformly trimmable (e.g. some sliding-window attention) fall back to a clean miss rather than incorrect reuse.
 
 ## Contributing

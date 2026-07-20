@@ -12,7 +12,16 @@ enum PromptCacheIO {
     /// `ChunkedKVCache`/`CacheList` hold recurrent or circular state that can't be trimmed to a token
     /// prefix — this mirrors `HotCodec.extract`'s gate and oMLX's `supports_block_slicing`. Subtype-first
     /// (`QuantizedKVCache` before `KVCacheSimple`), matching `HotCodec`.
-    static func isSliceableLayer(_ c: KVCache) -> Bool { c is QuantizedKVCache || c is KVCacheSimple }
+    /// `ChunkedKVCache` is excluded first: it subclasses `KVCacheSimple`, so the `is KVCacheSimple`
+    /// test would otherwise report it sliceable — contradicting the line above and the truth, since it
+    /// carries a `startPosition` and front-trims (`maybeTrimFront`), so slicing it by absolute offset
+    /// mis-keys the prefix. No shipped model returns one today, so this changes no in-use behaviour; it
+    /// aligns the code with its documented intent and makes a future chunked model degrade to a clean
+    /// boundary-only capture instead of a silently wrong trim.
+    static func isSliceableLayer(_ c: KVCache) -> Bool {
+        if c is ChunkedKVCache { return false }
+        return c is QuantizedKVCache || c is KVCacheSimple
+    }
 
     /// True iff EVERY layer is sliceable — only then can a snapshot be trimmed to a sub-prefix. A single
     /// non-sliceable layer (i.e. a hybrid model) makes the whole snapshot reusable only at a *captured*

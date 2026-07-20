@@ -28,6 +28,13 @@ enum HotCodec {
         out.reserveCapacity(caches.count)
         for cache in caches {
             let className: String
+            // ChunkedKVCache subclasses KVCacheSimple, so it would match the `is KVCacheSimple`
+            // branch below and be tagged "KVCacheSimple". But it carries a 2-element metaState
+            // (chunkSize, startPosition), and `reconstruct` sets that on a plain KVCacheSimple —
+            // whose BaseKVCache metaState setter fatalErrors on any non-empty value (an ALWAYS-active
+            // trap, release included). Exclude it explicitly, before that branch, so a ChunkedKVCache
+            // model degrades to cold-only instead of hard-crashing on hot reconstruct.
+            if cache is ChunkedKVCache { return nil }
             if cache is QuantizedKVCache { className = "QuantizedKVCache" }   // subtype-first
             else if cache is KVCacheSimple { className = "KVCacheSimple" }
             else { return nil }                                              // unsupported → no hot entry

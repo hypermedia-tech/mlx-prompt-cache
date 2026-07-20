@@ -36,7 +36,6 @@ struct Options {
     var models: [ModelSpec] = ModelSpec.all
     var tokens = 16_384
     var resumes = 8
-    var repeats = 3
     var jsonPath: String?
     var skipCanary = false
     /// Simulate a smaller machine by holding anonymous memory, so the page cache cannot absorb
@@ -53,7 +52,6 @@ struct Options {
                 else { print("unknown --model; known: \(ModelSpec.all.map(\.short))"); exit(2) }
             case "--tokens": o.tokens = it.next().flatMap { Int($0) } ?? o.tokens
             case "--resumes": o.resumes = it.next().flatMap { Int($0) } ?? o.resumes
-            case "--repeats": o.repeats = it.next().flatMap { Int($0) } ?? o.repeats
             case "--json": o.jsonPath = it.next()
             case "--no-canary": o.skipCanary = true
             case "--free-ram":
@@ -66,7 +64,6 @@ struct Options {
                   --tokens N              prefix length to warm (default 16384)
                                           use 183296 to reproduce the production measurement
                   --resumes R             number of pause/resume rounds (default 8)
-                  --repeats K             repeats per timing cell (default 3, median reported)
                   --json <path>           write the machine-readable artifact
                   --no-canary             skip the process-global eval-lock probe
                   --free-ram G            simulate a G-gigabyte machine by holding ballast memory,
@@ -103,6 +100,7 @@ struct ModelReport: Codable {
     var statusQuoPeakBytes: Int = 0
     var residencyPeakBytes: Int = 0
     var ballastBytes: Int = 0
+    var heldVsColdDiff: StateDiff?
     var contentionWaitMs: [Double] = []
     var notes: [String] = []
 }
@@ -170,7 +168,7 @@ let scratchRoot = Scratch.begin()
 let ram = Int(ProcessInfo.processInfo.physicalMemory)
 let freeDisk = Proc.freeDiskBytes(at: scratchRoot) ?? 0
 print("host: \(fmtBytes(ram)) RAM · \(fmtBytes(freeDisk)) free disk · thermal \(ProcessInfo.processInfo.thermalState == .nominal ? "nominal" : "NON-NOMINAL")")
-print("plan: T=\(opts.tokens) tokens · R=\(opts.resumes) resumes · \(opts.repeats) repeats/cell · block=\(blockSize)")
+print("plan: T=\(opts.tokens) tokens · R=\(opts.resumes) resumes · block=\(blockSize) · n=1 per cell")
 if opts.freeRamBytes > 0 {
     print("ballast: squeezing to ~\(fmtBytes(opts.freeRamBytes)) free …")
     let held = Ballast.squeeze(toFreeBytes: opts.freeRamBytes)
@@ -230,8 +228,22 @@ for spec in opts.models {
         continue
     }
     let T = (tTarget / blockSize) * blockSize
+
     let tokens = Array(corpusTokens.prefix(T))
     let question = await mc.encode("\n\nQ: one sentence — most suspicious behaviour?\nA:")
+
+    // Not every phase needs production scale. G2/G3 measure I/O volume, which is the whole point of
+    // a large T; the isolated persist measurement needs it too, because persist cost scales with
+    // snapshot size. But G4 is a correctness gate, G5's canary just needs SOME MLX work running to
+    // sample the lock, and G6 is a boolean about whether a tier populates — running those at 183k
+    // costs four extra full-length prefills and proves nothing extra. Pin them.
+    let probeBoundary = min((T - 1) / blockSize * blockSize, (16_384 / blockSize) * blockSize)
+    let probePrompt = Array(tokens.prefix(probeBoundary + 1))
+    let probeRounds = 4
+    let probeChunks = max(1, probeBoundary / (probeRounds * blockSize))
+    if probeBoundary < (T - 1) / blockSize * blockSize {
+        print("  scale: G2/G3/G5-persist at \((T - 1) / blockSize * blockSize) tokens · G4/G5-canary/G6 at \(probeBoundary) (correctness + boolean gates, scale-invariant)")
+    }
 
     // Warm up Metal so the first timing is not one-time init.
     _ = try await mc.perform { ctx in
@@ -253,8 +265,9 @@ for spec in opts.models {
     // ── G1 · byte model: measured A, M vs analytic prediction ───────────────────────────────
     print("\n  ── G1 byte model ──")
     var pts: [(Int, Int)] = []
+    let fitT = probeBoundary            // the fit is exact at probe scale; see the full-scale check below
     for frac in [4, 2, 1] {
-        let n = (T / frac / blockSize) * blockSize
+        let n = (fitT / frac / blockSize) * blockSize
         guard n >= blockSize * 2 else { continue }
         let dir = Scratch.store("g1-\(spec.short)-\(n)")
         let probe = IOProbe()
@@ -304,6 +317,7 @@ for spec in opts.models {
     // ── Shared arm plumbing ─────────────────────────────────────────────────────────────────
     let chunksPerRound = max(1, T / (opts.resumes * blockSize))
     let boundary = (T - 1) / blockSize * blockSize
+
 
     /// Status-quo arm: today's `warm`, called once per resume. Each call re-enters `store.reuse`
     /// (loading the whole previous snapshot) and ends in a whole-prefix `record`.
@@ -386,7 +400,13 @@ for spec in opts.models {
     /// cache resident, and generates directly off it. That is the state residency actually creates,
     /// and it is the only arm that exercises the held cache with no disk round trip at all.
     func runResidency(persist: WarmPersistence = .onCompletion,
-                      generateFromHeld: Bool = false) async throws -> (arm: ArmResult, ids: [Int]) {
+                      generateFromHeld: Bool = false,
+                      prompt: [Int]? = nil,
+                      upTo: Int? = nil,
+                      chunks: Int? = nil) async throws -> (arm: ArmResult, ids: [Int]) {
+        let toks = prompt ?? tokens
+        let bnd = upTo ?? boundary
+        let cpr = chunks ?? chunksPerRound
         let dir = Scratch.store("res-\(spec.short)")
         defer { try? FileManager.default.removeItem(at: dir) }
         let probe = IOProbe()
@@ -399,9 +419,9 @@ for spec in opts.models {
         var reached = 0
         var round = 0
         // Stop one full round short so the cache is still held when we generate off it.
-        let target = generateFromHeld ? max(blockSize, boundary - chunksPerRound * blockSize) : boundary
+        let target = generateFromHeld ? max(blockSize, bnd - cpr * blockSize) : bnd
 
-        while reached < target && round < opts.resumes * 3 {
+        while reached < target && round < opts.resumes * 4 {
             round += 1
             probe.reset()
             let before = Census.of(dir)
@@ -411,10 +431,10 @@ for spec in opts.models {
 
             let t0 = ContinuousClock.now
             let got: Int = await mc.perform { ctx in
-                var chunks = 0
-                let outcome = coord.warm(warms, id: id, promptTokens: tokens, model: ctx.model,
+                var fired = 0
+                let outcome = coord.warm(warms, id: id, promptTokens: toks, model: ctx.model,
                                          parameters: params, persist: persist,
-                                         shouldPause: { chunks += 1; return chunks >= chunksPerRound })
+                                         shouldPause: { fired += 1; return fired >= cpr })
                 switch outcome {
                 case let .paused(c): return c
                 case let .complete(c, _): return c
@@ -453,7 +473,20 @@ for spec in opts.models {
         var ids: [Int] = []
         if generateFromHeld {
             let held = reached
-            let tail = Array(tokens[held...]) + question
+            // Compare the HELD cache against one prefilled in a single pass to the same offset,
+            // using the comparator the sensitivity control validates. Token IDs are a weaker probe:
+            // 32 greedy samples taken after the state is already fixed can miss a small divergence
+            // that a tensor-level diff cannot.
+            rep.heldVsColdDiff = try await mc.perform { ctx -> StateDiff in
+                guard let heldCache = coord.heldCache(warms, id: id, model: ctx.model) else {
+                    throw BenchError.armDidNoWork("nothing held for state diff")
+                }
+                let cold = makePromptCache(model: ctx.model, parameters: params)
+                try Prefill.chunk(Array(toks[0 ..< held]), into: cold,
+                                  model: ctx.model, stepSize: blockSize)
+                return diffStates(heldCache, cold)
+            }
+            let tail = Array(toks[held...]) + question
             ids = try await mc.perform { ctx in
                 guard let cache = coord.heldCache(warms, id: id, model: ctx.model) else {
                     throw BenchError.armDidNoWork("nothing held after \(held) tokens")
@@ -490,6 +523,18 @@ for spec in opts.models {
     rep.statusQuo = sq
     for s in sq.samples {
         print("    r\(pad("\(s.round)", 3)) reached=\(pad("\(s.reachedTokens)", 7)) write=\(pad(fmtBytes(s.logicalWriteBytes), 10)) read=\(pad(fmtBytes(s.logicalReadBytes), 10)) wall=\(pad(fmtMs(s.wallMs), 9)) fsync=\(pad(fmtMs(s.fsyncMs), 8)) devW=\(fmtBytes(s.deviceWriteBytes)) devR=\(fmtBytes(s.deviceReadBytes))")
+    }
+    // Free full-scale validation of the byte model: G2's final snapshot IS bytes(boundary), so no
+    // extra prefill is needed to confirm the fit extrapolates to production scale.
+    if let last = sq.samples.last, last.logicalWriteBytes > 0 {
+        let predicted = Double(spec.predictedA * last.reachedTokens) + rep.measuredM
+        let err = abs(Double(last.logicalWriteBytes) - predicted) / predicted
+        print(String(format: "    full-scale check: snapshot at %d tokens = %@, model predicts %@ (%+.3f%%)",
+                     last.reachedTokens, fmtBytes(last.logicalWriteBytes),
+                     fmtBytes(Int(predicted)), err * 100))
+        rep.gates.append(gate("G2.modelAtScale", err < 0.01,
+                              String(format: "byte model holds at %d tokens (%+.3f%%)",
+                                     last.reachedTokens, err * 100)))
     }
     let sqRoundTrip = sq.totalLogicalWrite + sq.totalLogicalRead
     print("    TOTAL logical write \(fmtBytes(sq.totalLogicalWrite)) + read \(fmtBytes(sq.totalLogicalRead)) = \(fmtBytes(sqRoundTrip))")
@@ -549,13 +594,21 @@ for spec in opts.models {
     let genParams = makeParams(maxTokens: 32)
 
     let coldIDs = try await mc.perform { ctx in
-        try await generateInside(ctx, tokens: tokens + question,
+        try await generateInside(ctx, tokens: probePrompt + question,
                                  cache: makePromptCache(model: ctx.model, parameters: genParams),
                                  params: genParams)
     }
-    let (_, heldIDs) = try await runResidency(persist: .never, generateFromHeld: true)
+    let (_, heldIDs) = try await runResidency(persist: .never, generateFromHeld: true,
+                                              prompt: probePrompt, upTo: probeBoundary, chunks: probeChunks)
     print("    cold=\(coldIDs.prefix(6))… held=\(heldIDs.prefix(6))…")
     let lossless = !coldIDs.isEmpty && coldIDs == heldIDs
+    if let d = rep.heldVsColdDiff {
+        print("    held vs single-pass cold cache: \(d.summary)")
+        rep.gates.append(gate("G4.stateIdentical", d.identical,
+                              d.identical
+                                  ? "cache held across pause/resume is BIT-IDENTICAL to a single-pass prefill"
+                                  : "held cache diverged from single-pass: \(d.summary)"))
+    }
     rep.gates.append(gate("G4.heldEqCold", lossless,
                           lossless ? "generation off the HELD cache is token-identical to cold"
                                    : "DIVERGED at index \(zip(coldIDs, heldIDs).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? min(coldIDs.count, heldIDs.count))"))
@@ -664,13 +717,13 @@ for spec in opts.models {
             }
             return gaps
         }
-        let dir = Scratch.store("canary-\(spec.short)")
+        let dir = Scratch.store("canary-\(spec.short)")   // probe scale: the canary only needs MLX work running
         let probe = IOProbe()
         let store = try PromptCacheStore(directory: dir, budgetBytes: 1 << 40, signature: sig,
                                          blockSize: blockSize, hotBudgetBytes: 0, log: probe.sink)
         let coord = PromptCacheCoordinator(store: store)
         _ = await mc.perform { ctx in
-            coord.warm(promptTokens: tokens, model: ctx.model, parameters: params)
+            coord.warm(promptTokens: probePrompt, model: ctx.model, parameters: params)
         }
         stop.withLock { $0 = true }
         let gaps = await canary.value
@@ -695,18 +748,18 @@ for spec in opts.models {
                                          blockSize: blockSize, hotBudgetBytes: 1 << 34, log: probe.sink)
         let coord = PromptCacheCoordinator(store: store)
         _ = await mc.perform { ctx in
-            coord.warm(promptTokens: tokens, model: ctx.model, parameters: params)
+            coord.warm(promptTokens: probePrompt, model: ctx.model, parameters: params)
         }
         // TWO reuses, not one. `record` never warms the RAM tier (warmHot: false —
         // PromptCacheStore.swift:96), and the FIRST reuse populates it but reports
         // `HIT (cold/disk, full)` (:81). Only the second can log `HIT (hot/RAM)` (:56).
         // The first run probed after one call and reported a false negative on the 1.7B.
         _ = await mc.perform { ctx in
-            coord.prepare(promptTokens: tokens + question, model: ctx.model, parameters: params).suffixStart
+            coord.prepare(promptTokens: probePrompt + question, model: ctx.model, parameters: params).suffixStart
         }
         probe.reset()
         _ = await mc.perform { ctx in
-            coord.prepare(promptTokens: tokens + question, model: ctx.model, parameters: params).suffixStart
+            coord.prepare(promptTokens: probePrompt + question, model: ctx.model, parameters: params).suffixStart
         }
         let hotHit = probe.lines.contains { $0.contains("HIT (hot/RAM)") }
         let expectHot = !spec.isHybrid
