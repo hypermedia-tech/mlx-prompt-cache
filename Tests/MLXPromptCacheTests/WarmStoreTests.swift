@@ -61,7 +61,7 @@ import Testing
         #expect(loads == 0)                                     // nothing reloaded…
         #expect(saves == 0)                                     // …and nothing written on a pause
         #expect(snapshotCount(in: dir) == 0)                    // log-independent proof: disk untouched
-        #expect(warms.residentBytes > 0)
+        #expect(warms.residentBytes(scope: scope) > 0)
     }
 
     @Test func heldCacheIsTheSameObjectAcrossResumes() throws {
@@ -75,14 +75,10 @@ import Testing
 
         _ = coord.warm(warms, id: id, promptTokens: tokens, model: model,
                        parameters: blockStepParams(), scope: scope, shouldPause: { true })
-        // `heldCache` pulled to a local: a `~Escapable` `scope` cannot cross a `#require`/`#expect`
-        // macro boundary, so the call must complete before the macro sees only its `[KVCache]?` result.
-        let firstHeld = coord.heldCache(warms, id: id, model: model, scope: scope)
-        let first = try #require(firstHeld)
+        let first = try #require(coord.heldCache(warms, id: id, model: model, scope: scope))
         _ = coord.warm(warms, id: id, promptTokens: tokens, model: model,
                        parameters: blockStepParams(), scope: scope, shouldPause: { true })
-        let secondHeld = coord.heldCache(warms, id: id, model: model, scope: scope)
-        let second = try #require(secondHeld)
+        let second = try #require(coord.heldCache(warms, id: id, model: model, scope: scope))
 
         #expect(first.count == 2)
         // Extended in place, never rebuilt — the same layer objects carry forward.
@@ -136,7 +132,7 @@ import Testing
         #expect(cached == 512)
         #expect(lines.withLock { $0.filter { $0.hasPrefix("record: saved") }.count } == 1)
         #expect(store.peek(forTokens: tokens) == 512)           // durable
-        #expect(warms.isEmpty)                                  // and the RAM is given back
+        #expect(warms.isEmpty(scope: scope))                                  // and the RAM is given back
     }
 
     @Test func neverPersistLeavesDiskUntouched() throws {
@@ -171,13 +167,12 @@ import Testing
         let out = coord.warm(warms, id: id, promptTokens: tokens, model: model,
                              parameters: blockStepParams(), scope: scope, persist: .never)
         guard case .complete = out else { Issue.record("expected .complete, got \(out)"); return }
-        #expect(warms.isEmpty == false)                        // the work is still recoverable…
-        let heldNever = coord.heldCache(warms, id: id, model: model, scope: scope)
-        #expect(PromptCacheIO.tokenLength(heldNever ?? []) == 512)
+        #expect(warms.isEmpty(scope: scope) == false)                        // the work is still recoverable…
+        #expect(PromptCacheIO.tokenLength(coord.heldCache(warms, id: id, model: model, scope: scope) ?? []) == 512)
 
         _ = coord.finishWarm(warms, id: id, model: model, scope: scope)       // …and finishWarm can still save it
         #expect(store.peek(forTokens: tokens) == 512)
-        #expect(warms.isEmpty)
+        #expect(warms.isEmpty(scope: scope))
     }
 
     @Test func finishWarmPersistsAndReleases() throws {
@@ -197,7 +192,7 @@ import Testing
         let out = coord.finishWarm(warms, id: id, model: model, scope: scope)
         guard case .complete = out else { Issue.record("expected .complete, got \(out)"); return }
         #expect(store.peek(forTokens: tokens) == 256)           // …abandonment keeps the work
-        #expect(warms.isEmpty)
+        #expect(warms.isEmpty(scope: scope))
     }
 
     @Test func everyTokensPersistsOnCadence() throws {
@@ -263,8 +258,7 @@ import Testing
                                parameters: params, scope: scope, shouldPause: { true })
         guard case let .paused(c) = first else { Issue.record("expected .paused, got \(first)"); return }
         #expect(c == 256)
-        let heldHybrid = coord.heldCache(warms, id: id, model: hybridModel(), scope: scope)
-        #expect(PromptCacheIO.isSliceable(heldHybrid ?? []) == false)
+        #expect(PromptCacheIO.isSliceable(coord.heldCache(warms, id: id, model: hybridModel(), scope: scope) ?? []) == false)
 
         let second = coord.warm(warms, id: id, promptTokens: tokens, model: hybridModel(),
                                 parameters: params, scope: scope)
@@ -273,7 +267,7 @@ import Testing
         }
         #expect(total == 512)
         #expect(store.peek(forTokens: tokens) == 512)
-        #expect(warms.isEmpty)
+        #expect(warms.isEmpty(scope: scope))
     }
 
     // MARK: - Budget
@@ -290,12 +284,12 @@ import Testing
 
         _ = coord.warm(warms, id: a, promptTokens: ta, model: twoLayerModel(),
                        parameters: blockStepParams(), scope: scope, shouldPause: { true })
-        #expect(warms.heldIds.count == 1)
+        #expect(warms.heldIds(scope: scope).count == 1)
 
         // Warming b evicts a — but persists it first, so the work is not lost.
         _ = coord.warm(warms, id: b, promptTokens: tb, model: twoLayerModel(),
                        parameters: blockStepParams(), scope: scope, shouldPause: { true })
-        #expect(warms.heldIds == [b])
+        #expect(warms.heldIds(scope: scope) == [b])
         #expect(store.peek(forTokens: ta) == 256)               // a's progress survived on disk
     }
 
@@ -337,7 +331,7 @@ import Testing
                                           parameters: blockStepParams(), scope: scope, persist: .never)
         else { Issue.record("warm did not complete"); return }
         #expect(store.peek(forTokens: tokens) == 0)             // .never wrote nothing…
-        #expect(warms.isEmpty == false)                         // …and kept it resident
+        #expect(warms.isEmpty(scope: scope) == false)                         // …and kept it resident
 
         let out = coord.warm(warms, id: id, promptTokens: tokens, model: twoLayerModel(),
                              parameters: blockStepParams(), scope: scope, persist: .never)
@@ -347,7 +341,7 @@ import Testing
         #expect(cached == 512)
         #expect(prefilled == 0)                                 // nothing left to prefill
         #expect(store.peek(forTokens: tokens) == 512)           // finishWarm persisted it…
-        #expect(warms.isEmpty)                                  // …and released
+        #expect(warms.isEmpty(scope: scope))                                  // …and released
     }
 
     /// `finishWarm` on an id that was never held (fresh store, already released, wrong id) is a clean
@@ -371,10 +365,10 @@ import Testing
                            model: twoLayerModel(), parameters: blockStepParams(), scope: scope,
                            shouldPause: { true })
         }
-        #expect(warms.heldIds.count == 3)
+        #expect(warms.heldIds(scope: scope).count == 3)
         warms.releaseAll(scope: scope)
-        #expect(warms.isEmpty)
-        #expect(warms.residentBytes == 0)
+        #expect(warms.isEmpty(scope: scope))
+        #expect(warms.residentBytes(scope: scope) == 0)
     }
 }
 

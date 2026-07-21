@@ -543,10 +543,12 @@ for spec in opts.models {
             }
             // Abandonment path: persist what is held and free it. Exercises the real finishWarm.
             probe.reset()
-            _ = await mc.perform { ctx in
-                coord.finishWarm(warms, id: id, model: ctx.model, scope: coord.scope(ctx))
+            let emptied = await mc.perform { ctx -> Bool in
+                let s = coord.scope(ctx)
+                coord.finishWarm(warms, id: id, model: ctx.model, scope: s)
+                return warms.isEmpty(scope: s)
             }
-            guard warms.isEmpty else {
+            guard emptied else {
                 throw BenchError.armDidNoWork("finishWarm did not release the held cache")
             }
         } else {
@@ -554,8 +556,12 @@ for spec in opts.models {
             guard probe.saveCount == 1 else {
                 throw BenchError.silentRefusal("completed warm saved \(probe.saveCount) times, expected 1")
             }
-            guard warms.isEmpty else {
-                throw BenchError.armDidNoWork("completed warm left \(warms.residentBytes) bytes resident")
+            let (emptied, residentBytes) = await mc.perform { ctx -> (Bool, Int) in
+                let s = coord.scope(ctx)
+                return (warms.isEmpty(scope: s), warms.residentBytes(scope: s))
+            }
+            guard emptied else {
+                throw BenchError.armDidNoWork("completed warm left \(residentBytes) bytes resident")
             }
         }
         return (arm, ids)

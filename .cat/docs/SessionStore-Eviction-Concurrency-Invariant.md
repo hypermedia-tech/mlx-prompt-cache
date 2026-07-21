@@ -9,10 +9,13 @@ still the open decision.
 
 > **On the AFTER code:** every BEFORE block is copied verbatim from the source as it was before the change. The
 > AFTER blocks were **applied to the `MLXPromptCache` package and verified**: it builds and all 29
-> SessionStore/WarmStore tests pass on the installed toolchain — `~Escapable`, `@lifetime(immortal)`,
-> `@lifetime(borrow context)` and the `LifetimeDependence` flag all compile. The two consumers in the separate
-> `TanukiPlatform` package (§5, §5.1) were **not** built here; their edits are specified but unverified. Line
-> references are exact as of writing.
+> SessionStore/WarmStore tests pass. `PerformScope` is a **plain value type** (`struct PerformScope { package
+> init() {} }`) — **no** `~Escapable`, `@lifetime`, or experimental `Lifetimes`/`LifetimeDependence` feature.
+> An earlier draft used the nonescapable form; it was abandoned because that feature's attribute spelling is
+> unstable across toolchains (`@lifetime` vs `@_lifetime`, gated behind an experimental flag) — an unacceptable
+> base for a shipping library. The plain type compiles on any Swift 6 toolchain. The two consumers in the
+> separate `TanukiPlatform` package (§5, §5.1) were **not** built here; their edits are specified but unverified.
+> Line references are exact as of writing.
 
 ---
 
@@ -63,8 +66,12 @@ idiomatic way to enforce that in Swift 6.2 is a **proof-of-context token** the c
 A value obtainable **only** inside `perform`, required by every cache-mutating door. External callers cannot
 construct it (its initialiser is `package`); the only public way to get one needs the `ModelContext` that
 `perform` hands in — and that context is non-`Sendable`, so it cannot escape the closure. A cache-mutating call
-from off the model queue therefore **does not compile**. `~Escapable` so the token cannot be stashed and reused
-after `perform` returns.
+from off the model queue by an external caller therefore **does not compile**.
+
+**Residual (accepted):** `PerformScope` is a plain value, not `~Escapable`, so a caller *inside the package*
+could stash a minted token and reuse it later off-`perform`. Closing that would need the experimental
+`Lifetimes` feature, whose unstable attribute spelling disqualifies it for a shipping library (see the banner).
+The narrow in-package stash hole is the deliberate price of not depending on an experimental feature.
 
 `SessionStore` and `WarmStore` are unchanged — their mutating methods are `package`, so external code already
 cannot reach them; the only external path to `live` is the coordinator's public doors, which is what we gate.
@@ -87,10 +94,13 @@ public final class PromptCacheCoordinator: Sendable {
 /// door that mutates the live-cache stores (`SessionStore`/`WarmStore`) requires one. External callers
 /// cannot construct it — the initialiser is `package` — so the ONLY way to obtain one is
 /// `PromptCacheCoordinator.scope(_:)`, which needs a `ModelContext` and can therefore only be called from
-/// inside a `perform` block. A cache-mutating call from off the model queue is a compile error, not a
-/// runtime race. `~Escapable` so it cannot be stashed and reused after the `perform` returns.
-public struct PerformScope: ~Escapable {
-    @lifetime(immortal)
+/// inside a `perform` block. An external cache-mutating call from off the model queue is a compile error, not
+/// a runtime race.
+///
+/// Deliberately a plain value, NOT `~Escapable`: the nonescapable form needs the experimental `Lifetimes`
+/// feature, whose attribute spelling is unstable across toolchains — unacceptable for a shipping library. The
+/// residual this accepts: an in-package caller could stash a token and reuse it after `perform` returns.
+public struct PerformScope {
     package init() {}
 }
 
@@ -102,7 +112,6 @@ public final class PromptCacheCoordinator: Sendable {
     /// Mint a `PerformScope`. Requires the `ModelContext` handed to a `ModelContainer.perform` closure —
     /// non-`Sendable`, so it cannot escape that closure — meaning a scope can only be created inside
     /// `perform`. The single door to the cache-mutating API's proof-of-context.
-    @lifetime(borrow context)
     public func scope(_ context: borrowing ModelContext) -> PerformScope { PerformScope() }
 ```
 
@@ -350,7 +359,7 @@ must take the same witness, or the enforcement leaks.
 `PerformScope` lives in the same module (declared in `PromptCacheCoordinator.swift`, §3.1), so `WarmStore` can
 reference it with no import change.
 
-### 3.5 What is intentionally NOT gated, and the read residual
+### 3.5 What is intentionally NOT gated
 
 - **`prepare(...)` and the plain `warm(promptTokens:model:parameters:shouldPause:)`** touch only the
   `Sendable` `PromptCacheStore` (disk + its `Mutex`-guarded catalog), never `SessionStore`/`WarmStore`'s `live`.
@@ -358,56 +367,28 @@ reference it with no import change.
 - **`SessionStore`'s `advance`/`release`/`residentBytes`/`victimsOverBudget`** are `package`: external code
   cannot reach them, and the in-package callers (the coordinator's already-gated doors, and the tests) are
   trusted. No change.
-- **Read residual — a decision.** `WarmStore`'s public `heldIds` / `isEmpty` / `residentBytes` *read* `live`. A
-  read concurrent with an in-`perform` write is also UB, strictly. This note gates the **mutators** (where the
-  heap-corrupting structural writes happen) and leaves these three reads on the `perform` convention, because
-  gating them forces every metrics/logging read to carry a scope for little practical gain. If you want the
-  invariant fully airtight, convert them to `func heldIds(scope:)` etc. the same way — flagged, not done, so the
-  boundary is explicit rather than silently assumed safe.
+- **The read residual is CLOSED.** `WarmStore`'s public `heldIds` / `isEmpty` / `residentBytes` are now
+  `func …(scope:)`, gated exactly like the mutators (applied + green — see the WarmStore reads change). A read
+  concurrent with an in-`perform` write is also UB, so leaving them as bare getters would have left the hole
+  half-open; they now require the same witness. The type's own `perform`-confined methods (`victimsOverBudget`)
+  use a private ungated `residentBytesUnchecked`, so the gate lands on the *public* surface only. **Every public
+  path to `live` — mutator or read — is compile-gated to inside `perform`.** The only remaining trust is the
+  narrow in-package stash of a scope value (§3 residual).
 
-### 3.6 `Package.swift` — enable the nonescapable/lifetime features
+### 3.6 `Package.swift` — no change
 
-`~Escapable` and the `@lifetime` attribute are lifetime-dependency features. On some 6.x toolchains they compile
-as-is; on others they need the experimental feature enabled on the target. Add it defensively; drop it if the
-build accepts the attributes without it (see §7.1).
-
-**BEFORE** (`Package.swift:28-34`, verbatim):
-
-```swift
-        .target(
-            name: "MLXPromptCache",
-            dependencies: [
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-            ]
-        ),
-```
-
-**AFTER**:
-
-```swift
-        .target(
-            name: "MLXPromptCache",
-            dependencies: [
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-            ],
-            swiftSettings: [
-                .enableExperimentalFeature("LifetimeDependence"),
-            ]
-        ),
-```
-
-(`swift-tools-version` is already `6.3` and `swiftLanguageModes: [.v6]`; no change there.)
+The plain `PerformScope` uses no experimental features, so **`Package.swift` is untouched**. (An earlier draft
+added `.enableExperimentalFeature("LifetimeDependence")` for the `~Escapable` form; that was removed along with
+the nonescapable type — it doesn't compile portably, and the plain value needs nothing.)
 
 ---
 
 ## 4. What `@unchecked` this does and does not delete
 
-- **External callers** (everyone outside the package — including `MLXConversationEngine`): every public path
-  that *mutates* `live` is now gated — the coordinator session/warm doors (§3.2–3.3) **and** `WarmStore`'s own
-  public `release`/`releaseAll` (§3.4). Off-`perform` mutation becomes a compile error. Public *reads* remain on
-  the convention by choice (§3.5).
+- **External callers** (everyone outside the package — including `MLXConversationEngine`): every public path to
+  `live` is now gated — mutators (coordinator session/warm doors §3.2–3.3, `WarmStore.release`/`releaseAll`
+  §3.4) **and** reads (`WarmStore.heldIds`/`isEmpty`/`residentBytes`, now `func …(scope:)` §3.5). Any
+  off-`perform` access — write or read — is a compile error.
 - **`@unchecked Sendable` on `SessionStore`/`WarmStore` stays.** They still hold non-`Sendable` `[KVCache]` and
   are captured into the `@Sendable` perform closure, so they must remain `Sendable`. Deleting `@unchecked`
   entirely needs the larger refactor (caches living *inside* `ModelContext`, no free-standing store object) —
@@ -640,22 +621,18 @@ _ = coord.finishWarm(warms, id: id, model: model)
 _ = coord.finishWarm(warms, id: id, model: model, scope: scope)
 ```
 
-**`heldCache` needs care — a `~Escapable` scope cannot cross a `#require`/`#expect` macro boundary.** The
-compiler rejects `try #require(coord.heldCache(…, scope: scope))` ("requires that 'PerformScope' conform to
-'Escapable'"). Pull the call into a local first, then assert on the local:
+`heldCache` inside a `#require`/`#expect` is fine — `PerformScope` is a plain (`Escapable`) value, so it crosses
+the macro with no trouble:
 
 ```swift
-// BEFORE (:76)
+// BEFORE (:76)  →  AFTER — just add the argument, still inline:
 let first = try #require(coord.heldCache(warms, id: id, model: model))
-// AFTER — bind, then require:
-let firstHeld = coord.heldCache(warms, id: id, model: model, scope: scope)
-let first = try #require(firstHeld)
+let first = try #require(coord.heldCache(warms, id: id, model: model, scope: scope))
 ```
 
-The same rewrite applies to the two `#expect(… heldCache(…) …)` sites — `completionUnderNeverKeepsTheCacheResident`
-and `hybridWarmHoldsAcrossPausesAndCompletes`: bind `let held = coord.heldCache(…, scope: scope)` on its own
-line, then `#expect(… held ?? [] …)`. (This was the one compiler-forced deviation from the doc's original
-before/after; everything else applied verbatim.)
+(Historical note: an earlier `~Escapable` draft could **not** cross the macro — "requires that 'PerformScope'
+conform to 'Escapable'" — and forced a bind-then-assert workaround. Dropping the nonescapable type removed that
+constraint; the inline form above is what's in the suite.)
 
 Note the argument order: `scope:` sits **before** the defaulted `persist:`/`shouldPause:`, so calls that omit
 those defaults still read naturally. Behaviour and every `#expect` are unchanged.
@@ -714,12 +691,11 @@ per-call mint is the intended usage. Behavioural coverage of eviction itself is 
 
 ## 7. Open items before merge
 
-1. **Toolchain — CONFIRMED.** `~Escapable` + `@lifetime(immortal)` / `@lifetime(borrow context)` + the
-   `LifetimeDependence` flag compile as written, and the 29 SessionStore/WarmStore tests pass. One deviation the
-   compiler forced: a `~Escapable` scope cannot cross a `#require`/`#expect` macro, so `heldCache(…, scope:)` is
-   bound to a local before assertions (§6.2). Fallback to a plain escapable `struct PerformScope { package
-   init() {} }` remains available if the lifetime features become a burden — external enforcement is identical,
-   the only loss is a stashable token.
+1. **Toolchain — RESOLVED (no experimental features).** `PerformScope` is a plain `struct { package init() {} }`.
+   Builds and 29 tests pass with **no** `~Escapable`, `@lifetime`/`@_lifetime`, or `Lifetimes`/`LifetimeDependence`
+   flag — so it's portable across Swift 6 toolchains, not tied to one. (The abandoned `~Escapable` draft failed
+   exactly here: `@lifetime` vs `@_lifetime` and the experimental gate differ by toolchain, and it broke on a CLI
+   build even after an Xcode build went green.) Accepted cost: an in-package caller can stash a token (§3 residual).
 2. **Public-API break.** Breaking for every external caller of the gated doors — `MLXConversationEngine`
    (coordinator doors, §5) **and** any `WarmStore.release`/`releaseAll` caller such as `MLXContextWarmer`
    (§5.1). All consumer edits must land in the same release; bump the library major/minor accordingly. Grep

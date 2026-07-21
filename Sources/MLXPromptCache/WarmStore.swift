@@ -79,8 +79,8 @@ public final class WarmStore: @unchecked Sendable {
     /// fewest evictions. Empty when unbounded or under budget. Nothing is discarded: the coordinator
     /// persists each victim before releasing it.
     package func victimsOverBudget(excluding keep: UUID) -> [UUID] {
-        guard budgetBytes > 0, residentBytes > budgetBytes else { return [] }
-        var over = residentBytes - budgetBytes
+        guard budgetBytes > 0, residentBytesUnchecked > budgetBytes else { return [] }
+        var over = residentBytesUnchecked - budgetBytes
         var out: [UUID] = []
         for (id, e) in live.sorted(by: { $0.value.bytes > $1.value.bytes }) where id != keep {
             out.append(id)
@@ -100,9 +100,14 @@ public final class WarmStore: @unchecked Sendable {
     /// `perform` — the "memory pressure" caller must route through the model queue, not a bare handler.
     public func releaseAll(scope: borrowing PerformScope) { live.removeAll() }
 
-    public var heldIds: [UUID] { Array(live.keys) }
-    public var isEmpty: Bool { live.isEmpty }
-    public var residentBytes: Int { live.values.reduce(0) { $0 + $1.bytes } }
+    public func heldIds(scope: borrowing PerformScope) -> [UUID] { Array(live.keys) }
+    public func isEmpty(scope: borrowing PerformScope) -> Bool { live.isEmpty }
+    public func residentBytes(scope: borrowing PerformScope) -> Int { residentBytesUnchecked }
+
+    /// Internal, ungated byte sum for the type's OWN `perform`-confined methods (e.g. `victimsOverBudget`),
+    /// which already run inside the serialised domain and so need no witness. The public gate is
+    /// `residentBytes(scope:)`.
+    private var residentBytesUnchecked: Int { live.values.reduce(0) { $0 + $1.bytes } }
 
     /// Bytes of KV state a cache holds. Reads `state`, which for an attention layer is already
     /// sliced to `offset`, so this is the live footprint rather than the allocated capacity.

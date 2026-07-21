@@ -41,9 +41,9 @@ public enum PromptWarmOutcome: Sendable {
 /// cannot construct it — the initialiser is `package` — so the ONLY way to obtain one is
 /// `PromptCacheCoordinator.scope(_:)`, which needs a `ModelContext` and therefore can only be called from
 /// inside a `perform` block. A cache-mutating call from off the model queue is a compile error, not a
-/// runtime race. `~Escapable` so it cannot be stashed and reused after the `perform` returns.
-public struct PerformScope: ~Escapable {
-    @lifetime(immortal)
+/// runtime race.
+
+public struct PerformScope {
     package init() {}
 }
 
@@ -55,7 +55,6 @@ public final class PromptCacheCoordinator: Sendable {
     /// Mint a `PerformScope`. Requires the `ModelContext` handed to a `ModelContainer.perform` closure —
     /// which is non-`Sendable` and cannot escape that closure — so a scope can only be created inside
     /// `perform`. This is the single door to the cache-mutating API's proof-of-context.
-    @lifetime(borrow context)
     public func scope(_ context: borrowing ModelContext) -> PerformScope { PerformScope() }
 
     /// Reuse the longest cached prefix for `promptTokens`, or capture a fresh snapshot at the last full
