@@ -269,10 +269,11 @@ for model in models {
         // Both turns inside ONE perform. Nothing non-Sendable crosses: `sessions` + `coordinator` + the
         // UUID are all Sendable; the live [KVCache] is created, grown, and freed inside the store.
         let held: ConvOut = try await mc.perform { context in
+            let scope = coordinator.scope(context)
             // Turn 1 — whole document resident (seeded from the warm root), only the question prefills.
             let (d1in, cache1) = coordinator.advance(sessions, id: convId,
                 fullPromptTokens: document + qTokens, rootTokens: document,
-                model: context.model, parameters: convParams)
+                model: context.model, parameters: convParams, scope: scope)
             let d1 = d1in.text.tokens.shape.last ?? 0
             let t1 = Date(); var a1: [Int] = []; var ttft1 = 0.0
             for await g in try generateTokens(input: d1in, cache: cache1, parameters: convParams, context: context) {
@@ -281,13 +282,13 @@ for model in models {
             // Turn 2 — same id ⇒ the SAME live cache (document+Q1+A1 resident); only Q2 prefills.
             let (d2in, cache2) = coordinator.advance(sessions, id: convId,
                 fullPromptTokens: document + qTokens + a1 + qbTokens, rootTokens: document,
-                model: context.model, parameters: convParams)
+                model: context.model, parameters: convParams, scope: scope)
             let d2 = d2in.text.tokens.shape.last ?? 0
             let t2 = Date(); var a2: [Int] = []; var ttft2 = 0.0
             for await g in try generateTokens(input: d2in, cache: cache2, parameters: convParams, context: context) {
                 if case .token(let tok) = g { if a2.isEmpty { ttft2 = Date().timeIntervalSince(t2) * 1000 }; a2.append(tok) }
             }
-            coordinator.release(sessions, id: convId)
+            coordinator.release(sessions, id: convId, scope: scope)
             return ConvOut(d1: d1, d2: d2, a1: a1, a2Held: a2, ttft1: ttft1, ttft2: ttft2)
         }
 
