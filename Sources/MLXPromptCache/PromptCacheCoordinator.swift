@@ -347,4 +347,13 @@ extension PromptCacheCoordinator {
     public func release(_ sessions: SessionStore, id: UUID) {
         sessions.release(id)
     }
+    
+    /// Evict the largest held sessions over an APP-SUPPLIED byte budget, keeping `keep`. Unlike the warm-side
+    /// budget (which `WarmStore` stores at init), the session budget is passed in — the app owns it, resolving
+    /// live system RAM. NO persist-before-release: a session's durable source is the day-chunked log
+    /// (reassemble on next resume), so eviction just drops RAM. Idempotent. Call inside `perform` — the same
+    /// contract as `release`.
+    public func evictSessions(_ sessions: SessionStore, overBudget budgetBytes: Int, keep: UUID) {
+        for id in sessions.victimsOverBudget(budgetBytes, excluding: keep) { sessions.release(id) }
+    }
 }

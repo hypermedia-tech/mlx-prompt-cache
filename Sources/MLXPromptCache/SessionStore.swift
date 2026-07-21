@@ -46,4 +46,30 @@ public final class SessionStore: @unchecked Sendable {
     /// Free the GPU/RAM for one conversation. Idempotent. Dropping the store's only long-lived reference
     /// to the `[KVCache]` releases the Metal buffers via ARC. Call inside `perform` (same discipline).
     package func release(_ id: UUID) { live[id] = nil }
+    
+    package var residentBytes: Int {
+        live.values.reduce(0) {
+            $0 + WarmStore.footprint($1)
+        }
+    }
+    /// Ids to drop when resident bytes exceed the budget, largest-first (size policy, not LRU).
+    package func victimsOverBudget(
+        _ budgetBytes: Int,
+        excluding keep: UUID
+    ) -> [UUID] {
+        guard budgetBytes > 0, residentBytes > budgetBytes else { return [] }
+        var over = residentBytes - budgetBytes;
+        var out: [UUID] = []
+        for (id, cache) in live.sorted(
+            by: {
+                WarmStore.footprint($0.value) > WarmStore.footprint($1.value)
+            }
+        )
+        where id != keep {
+            out.append(id);
+            over -= WarmStore.footprint(cache);
+            if over <= 0 { break }
+        }
+        return out
+    }
 }

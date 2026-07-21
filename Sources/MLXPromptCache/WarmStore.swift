@@ -105,7 +105,7 @@ public final class WarmStore: @unchecked Sendable {
 
     /// Bytes of KV state a cache holds. Reads `state`, which for an attention layer is already
     /// sliced to `offset`, so this is the live footprint rather than the allocated capacity.
-    static func footprint(_ cache: [KVCache]) -> Int {
+    package static func footprint(_ cache: [KVCache]) -> Int {
         cache.reduce(0) { total, layer in
             total + layer.state.reduce(0) { $0 + $1.nbytes }
         }
