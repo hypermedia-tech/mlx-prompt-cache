@@ -472,9 +472,10 @@ for spec in opts.models {
 
             let t0 = ContinuousClock.now
             let got: Int = await mc.perform { ctx in
+                let scope = coord.scope(ctx)
                 var fired = 0
                 let outcome = coord.warm(warms, id: id, promptTokens: toks, model: ctx.model,
-                                         parameters: params, persist: persist,
+                                         parameters: params, scope: scope, persist: persist,
                                          shouldPause: { fired += 1; return fired >= cpr })
                 switch outcome {
                 case let .paused(c): return c
@@ -519,7 +520,8 @@ for spec in opts.models {
             // 32 greedy samples taken after the state is already fixed can miss a small divergence
             // that a tensor-level diff cannot.
             rep.heldVsColdDiff = try await mc.perform { ctx -> StateDiff in
-                guard let heldCache = coord.heldCache(warms, id: id, model: ctx.model) else {
+                let scope = coord.scope(ctx)
+                guard let heldCache = coord.heldCache(warms, id: id, model: ctx.model, scope: scope) else {
                     throw BenchError.armDidNoWork("nothing held for state diff")
                 }
                 let cold = makePromptCache(model: ctx.model, parameters: params)
@@ -529,7 +531,8 @@ for spec in opts.models {
             }
             let tail = Array(toks[held...]) + question
             ids = try await mc.perform { ctx in
-                guard let cache = coord.heldCache(warms, id: id, model: ctx.model) else {
+                let scope = coord.scope(ctx)
+                guard let cache = coord.heldCache(warms, id: id, model: ctx.model, scope: scope) else {
                     throw BenchError.armDidNoWork("nothing held after \(held) tokens")
                 }
                 guard attnOffset(cache) == held else {
@@ -541,7 +544,7 @@ for spec in opts.models {
             // Abandonment path: persist what is held and free it. Exercises the real finishWarm.
             probe.reset()
             _ = await mc.perform { ctx in
-                coord.finishWarm(warms, id: id, model: ctx.model)
+                coord.finishWarm(warms, id: id, model: ctx.model, scope: coord.scope(ctx))
             }
             guard warms.isEmpty else {
                 throw BenchError.armDidNoWork("finishWarm did not release the held cache")
@@ -717,9 +720,10 @@ for spec in opts.models {
         var reached = 0
         while reached < boundary {
             let got: Int = await mc.perform { ctx in
+                let scope = coord.scope(ctx)
                 var chunks = 0
                 let out = coord.warm(warms, id: id, promptTokens: tokens, model: ctx.model,
-                                     parameters: params, persist: .never,
+                                     parameters: params, scope: scope, persist: .never,
                                      shouldPause: { chunks += 1; return chunks >= chunksPerRound })
                 if case let .paused(c) = out { return c }
                 if case let .complete(c, _) = out { return c }
@@ -732,7 +736,7 @@ for spec in opts.models {
         probe.reset()
         let before = Census.of(dir)
         let t0 = ContinuousClock.now
-        _ = await mc.perform { ctx in coord.finishWarm(warms, id: id, model: ctx.model) }
+        _ = await mc.perform { ctx in coord.finishWarm(warms, id: id, model: ctx.model, scope: coord.scope(ctx)) }
         let recMs = (ContinuousClock.now - t0).ms
         guard probe.saveCount == 1, probe.refusals.isEmpty else {
             throw BenchError.silentRefusal("finishWarm saved \(probe.saveCount) \(probe.refusals)")

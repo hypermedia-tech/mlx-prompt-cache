@@ -36,10 +36,27 @@ public enum PromptWarmOutcome: Sendable {
 ///
 /// `Sendable` (holds only the `Sendable` store), so it can be captured into a model `perform` closure.
 /// `prepare` runs synchronously on the caller's thread, so the `[KVCache]` it returns never leaves it.
+/// Proof that the holder is executing inside `ModelContainer.perform`. Every `PromptCacheCoordinator`
+/// door that mutates the live-cache stores (`SessionStore`/`WarmStore`) requires one. External callers
+/// cannot construct it — the initialiser is `package` — so the ONLY way to obtain one is
+/// `PromptCacheCoordinator.scope(_:)`, which needs a `ModelContext` and therefore can only be called from
+/// inside a `perform` block. A cache-mutating call from off the model queue is a compile error, not a
+/// runtime race. `~Escapable` so it cannot be stashed and reused after the `perform` returns.
+public struct PerformScope: ~Escapable {
+    @lifetime(immortal)
+    package init() {}
+}
+
 public final class PromptCacheCoordinator: Sendable {
     private let store: PromptCacheStore
 
     public init(store: PromptCacheStore) { self.store = store }
+
+    /// Mint a `PerformScope`. Requires the `ModelContext` handed to a `ModelContainer.perform` closure —
+    /// which is non-`Sendable` and cannot escape that closure — so a scope can only be created inside
+    /// `perform`. This is the single door to the cache-mutating API's proof-of-context.
+    @lifetime(borrow context)
+    public func scope(_ context: borrowing ModelContext) -> PerformScope { PerformScope() }
 
     /// Reuse the longest cached prefix for `promptTokens`, or capture a fresh snapshot at the last full
     /// block boundary. Always returns a usable cache; `suffixStart` is where the caller begins generation.
@@ -204,6 +221,7 @@ extension PromptCacheCoordinator {
         promptTokens: [Int],
         model: any LanguageModel,
         parameters: GenerateParameters,
+        scope: borrowing PerformScope,
         persist: WarmPersistence = .onCompletion,
         shouldPause: () -> Bool = { false }
     ) -> PromptWarmOutcome {
@@ -233,7 +251,7 @@ extension PromptCacheCoordinator {
 
         guard start < boundary else {
             // Already at the boundary: persist if we are holding unpersisted work, then finish.
-            return finishWarm(warms, id: id, model: model)
+            return finishWarm(warms, id: id, model: model, scope: scope)
         }
 
         // 3. Chunked prefill, pausing on block boundaries so a hybrid's recurrent state always sits
@@ -269,7 +287,7 @@ extension PromptCacheCoordinator {
         // 5. Budget: persist-then-release the largest other warms if we are over.
         for victim in warms.victimsOverBudget(excluding: id) {
             persistHeld(warms, id: victim)
-            warms.release(victim)
+            warms.release(victim, scope: scope)
         }
 
         if done {
@@ -277,7 +295,7 @@ extension PromptCacheCoordinator {
             // would mean `.never` completes, writes nothing, and silently discards the whole warm —
             // so under `.never` the cache stays resident and the caller must `finishWarm` (persist
             // and free) or `release` (discard deliberately).
-            if shouldWrite { warms.release(id) }
+            if shouldWrite { warms.release(id, scope: scope) }
             return .complete(cachedTokens: boundary, prefilled: boundary - start)
         }
         return .paused(cachedTokens: reached)
@@ -293,11 +311,12 @@ extension PromptCacheCoordinator {
     public func finishWarm(
         _ warms: WarmStore,
         id: UUID,
-        model: any LanguageModel
+        model: any LanguageModel,
+        scope: borrowing PerformScope
     ) -> PromptWarmOutcome {
         guard let e = warms.entry(id) else { return .uncacheable(reason: "no warm held for id") }
         persistHeld(warms, id: id)
-        warms.release(id)
+        warms.release(id, scope: scope)
         return .complete(cachedTokens: e.prefix.count, prefilled: 0)
     }
 
@@ -307,7 +326,8 @@ extension PromptCacheCoordinator {
     public func heldCache(
         _ warms: WarmStore,
         id: UUID,
-        model: any LanguageModel
+        model: any LanguageModel,
+        scope: borrowing PerformScope
     ) -> [KVCache]? {
         warms.entry(id)?.cache
     }
@@ -323,17 +343,19 @@ extension PromptCacheCoordinator {
 }
 
 extension PromptCacheCoordinator {
-    /// Consumer-facing turn driver — the only public door to the live caches. Requires `model` (only
-    /// reachable via `context.model` inside `perform`), nudging "touch caches inside perform only" at the
-    /// type level. Seeds conversation `id` from the durable disk root (`store.reuse(forTokens: rootTokens)`)
-    /// on the first turn; thereafter the held cache is extended in place, never reloaded.
+    /// Consumer-facing turn driver — the only public door to the live caches. Requires a `PerformScope`
+    /// (obtainable ONLY inside `perform`, see `scope(_:)`), so a call from off the model queue does not
+    /// compile — the enforced form of the old "pass `model` as a nudge". Seeds conversation `id` from the
+    /// durable disk root (`store.reuse(forTokens: rootTokens)`) on the first turn; thereafter the held
+    /// cache is extended in place, never reloaded.
     public func advance(
         _ sessions: SessionStore,
         id: UUID,
         fullPromptTokens: [Int],
         rootTokens: [Int],
         model: any LanguageModel,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        scope: borrowing PerformScope
     ) -> (input: LMInput, cache: [KVCache]) {
         sessions.advance(
             id: id,
@@ -343,17 +365,22 @@ extension PromptCacheCoordinator {
         )
     }
 
-    /// Free conversation `id`'s live cache. Idempotent. Call inside `perform`.
-    public func release(_ sessions: SessionStore, id: UUID) {
+    /// Free conversation `id`'s live cache. Idempotent. The `PerformScope` gates this to inside `perform`.
+    public func release(_ sessions: SessionStore, id: UUID, scope: borrowing PerformScope) {
         sessions.release(id)
     }
-    
+
     /// Evict the largest held sessions over an APP-SUPPLIED byte budget, keeping `keep`. Unlike the warm-side
     /// budget (which `WarmStore` stores at init), the session budget is passed in — the app owns it, resolving
     /// live system RAM. NO persist-before-release: a session's durable source is the day-chunked log
-    /// (reassemble on next resume), so eviction just drops RAM. Idempotent. Call inside `perform` — the same
-    /// contract as `release`.
-    public func evictSessions(_ sessions: SessionStore, overBudget budgetBytes: Int, keep: UUID) {
+    /// (reassemble on next resume), so eviction just drops RAM. Idempotent. The `PerformScope` gates this to
+    /// inside `perform` — the same domain as `advance`/`release`, now enforced by the type system.
+    public func evictSessions(
+        _ sessions: SessionStore,
+        overBudget budgetBytes: Int,
+        keep: UUID,
+        scope: borrowing PerformScope
+    ) {
         for id in sessions.victimsOverBudget(budgetBytes, excluding: keep) { sessions.release(id) }
     }
 }

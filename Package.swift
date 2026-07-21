@@ -30,6 +30,9 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            swiftSettings: [
+                .enableExperimentalFeature("LifetimeDependence"),
             ]
         ),
         .executableTarget(

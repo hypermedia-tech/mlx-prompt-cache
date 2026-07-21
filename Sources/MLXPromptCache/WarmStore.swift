@@ -93,11 +93,12 @@ public final class WarmStore: @unchecked Sendable {
     // MARK: - Public lifecycle
 
     /// Free one warm's live cache. Idempotent. **Does not persist** — use
-    /// `PromptCacheCoordinator.finishWarm` to keep the work. Call inside `perform`.
-    public func release(_ id: UUID) { live[id] = nil }
+    /// `PromptCacheCoordinator.finishWarm` to keep the work. The `PerformScope` gates this to inside `perform`.
+    public func release(_ id: UUID, scope: borrowing PerformScope) { live[id] = nil }
 
-    /// Free every held cache (model swap, memory pressure, shutdown). Call inside `perform`.
-    public func releaseAll() { live.removeAll() }
+    /// Free every held cache (model swap, memory pressure, shutdown). The `PerformScope` gates this to inside
+    /// `perform` — the "memory pressure" caller must route through the model queue, not a bare handler.
+    public func releaseAll(scope: borrowing PerformScope) { live.removeAll() }
 
     public var heldIds: [UUID] { Array(live.keys) }
     public var isEmpty: Bool { live.isEmpty }

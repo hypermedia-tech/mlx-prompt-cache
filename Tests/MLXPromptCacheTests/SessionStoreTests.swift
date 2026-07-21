@@ -160,15 +160,16 @@ struct SessionStoreTests {
         else { Issue.record("warm did not complete"); return }
         let sessions = SessionStore()
         let id = UUID()
+        let scope = PerformScope()
 
         let (delta, cache) = coord.advance(sessions, id: id,
                                            fullPromptTokens: Fixture.tokens(512 + 20),
                                            rootTokens: root, model: twoLayerModel(),
-                                           parameters: GenerateParameters())
+                                           parameters: GenerateParameters(), scope: scope)
         #expect(PromptCacheIO.tokenLength(cache) == 512)                                   // seeded from the durable root
         #expect((delta.text.tokens.shape.last ?? 0) == 20)                                // only the new turn
 
-        coord.release(sessions, id: id)
+        coord.release(sessions, id: id, scope: scope)
         // After release the entry is gone, so the next advance re-seeds from the root rather than resuming.
         var reseeded = false
         let (_, cache2) = sessions.advance(id: id, fullPromptTokens: root,
@@ -176,5 +177,105 @@ struct SessionStoreTests {
             makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         #expect(reseeded)                                                                  // release dropped the live entry
         #expect(PromptCacheIO.tokenLength(cache2) == 512)
+    }
+
+    // MARK: - Eviction surface (app-budgeted session eviction, §3.1)
+
+    /// Seed conversation `id` with a specific cache (no prefill, no root) so its footprint is known.
+    @discardableResult
+    private func seed(_ sessions: SessionStore, _ id: UUID, cache: [KVCache]) -> [KVCache] {
+        sessions.advance(id: id, fullPromptTokens: [], warmRoot: { nil }, makeCache: { cache }).cache
+    }
+
+    private func snapshotCount(in dir: URL) -> Int {
+        ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "safetensors" }.count
+    }
+
+    // 9 — residentBytes is the sum of every held cache's live footprint.
+    @Test func residentBytesSumsHeldCaches() {
+        let sessions = SessionStore()
+        let a = Fixture.syntheticCache(tokens: 256)
+        let b = Fixture.syntheticCache(tokens: 512)
+        seed(sessions, UUID(), cache: a)
+        seed(sessions, UUID(), cache: b)
+        #expect(sessions.residentBytes == WarmStore.footprint(a) + WarmStore.footprint(b))
+    }
+
+    // 10 — under budget (and the disabled 0-budget) evict nothing.
+    @Test func victimsEmptyWhenUnderOrDisabled() {
+        let sessions = SessionStore()
+        seed(sessions, UUID(), cache: Fixture.syntheticCache(tokens: 256))
+        let big = sessions.residentBytes * 4
+        #expect(sessions.victimsOverBudget(big, excluding: UUID()).isEmpty)     // room to spare
+        #expect(sessions.victimsOverBudget(0, excluding: UUID()).isEmpty)       // 0 = unbounded
+    }
+
+    // 11 — largest-first, accumulating only until back under budget: the smallest survives.
+    @Test func evictsLargestFirstUntilUnderBudget() {
+        let sessions = SessionStore()
+        let small = UUID(), mid = UUID(), large = UUID()
+        let fa = WarmStore.footprint(seed(sessions, small, cache: Fixture.syntheticCache(tokens: 256)))
+        seed(sessions, mid, cache: Fixture.syntheticCache(tokens: 512))
+        seed(sessions, large, cache: Fixture.syntheticCache(tokens: 1024))
+        // Budget leaves room for only the smallest ⇒ drop large then mid, in that order, and stop.
+        let victims = sessions.victimsOverBudget(fa, excluding: UUID())
+        #expect(victims == [large, mid])                                        // biggest first, smallest spared
+    }
+
+    // 12 — `keep` is never a victim, even when it is the largest resident cache.
+    @Test func keepIsNeverEvictedEvenIfLargest() {
+        let sessions = SessionStore()
+        let a = UUID(), b = UUID(), keep = UUID()
+        seed(sessions, a, cache: Fixture.syntheticCache(tokens: 256))
+        seed(sessions, b, cache: Fixture.syntheticCache(tokens: 512))
+        seed(sessions, keep, cache: Fixture.syntheticCache(tokens: 1024))       // biggest — but kept
+        let victims = sessions.victimsOverBudget(1, excluding: keep)            // budget 1 ⇒ evict all it can
+        #expect(victims.contains(keep) == false)
+        #expect(Set(victims) == [a, b])                                         // everything else goes
+    }
+
+    // 13 — THE PUBLIC SEAM: evictSessions drops the over-budget victims' RAM and writes NOTHING to disk
+    //      (a session's durable source is the log, so eviction never persists — unlike the warm side).
+    @Test func evictSessionsDropsRamWithoutPersisting() throws {
+        let (dir, _, coord) = try makeStore()
+        let sessions = SessionStore()
+        let keep = UUID(), victim = UUID()
+        let fKeep = WarmStore.footprint(seed(sessions, keep, cache: Fixture.syntheticCache(tokens: 256)))
+        seed(sessions, victim, cache: Fixture.syntheticCache(tokens: 1024))     // the big one to shed
+
+        coord.evictSessions(sessions, overBudget: fKeep, keep: keep, scope: PerformScope())
+
+        #expect(sessions.residentBytes == fKeep)                                // only `keep` remains resident
+        #expect(snapshotCount(in: dir) == 0)                                    // NO persist-before-release
+        // `keep` is still live (advance does not re-seed it)…
+        var keepReseeded = false
+        _ = sessions.advance(id: keep, fullPromptTokens: [], warmRoot: { nil },
+                             makeCache: { keepReseeded = true; return [] as [KVCache] })
+        #expect(keepReseeded == false)
+        // …while the evicted victim re-seeds on its next advance.
+        var victimReseeded = false
+        _ = sessions.advance(id: victim, fullPromptTokens: [], warmRoot: { nil },
+                             makeCache: { victimReseeded = true; return Fixture.syntheticCache(tokens: 256) })
+        #expect(victimReseeded)
+    }
+
+    // 14 — evictSessions under budget is a no-op, and it is idempotent (a second call drops nothing more).
+    @Test func evictSessionsUnderBudgetIsNoOpAndIdempotent() throws {
+        let (_, _, coord) = try makeStore()
+        let sessions = SessionStore()
+        let keep = UUID(), other = UUID()
+        seed(sessions, keep, cache: Fixture.syntheticCache(tokens: 256))
+        seed(sessions, other, cache: Fixture.syntheticCache(tokens: 512))
+        let before = sessions.residentBytes
+        let scope = PerformScope()
+
+        coord.evictSessions(sessions, overBudget: before * 2, keep: keep, scope: scope)   // budget above resident
+        #expect(sessions.residentBytes == before)                              // nothing dropped
+
+        coord.evictSessions(sessions, overBudget: 1, keep: keep, scope: scope)            // now shed `other`
+        let afterFirstEvict = sessions.residentBytes
+        coord.evictSessions(sessions, overBudget: 1, keep: keep, scope: scope)            // idempotent
+        #expect(sessions.residentBytes == afterFirstEvict)
     }
 }
