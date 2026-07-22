@@ -374,12 +374,24 @@ extension PromptCacheCoordinator {
     /// live system RAM. NO persist-before-release: a session's durable source is the day-chunked log
     /// (reassemble on next resume), so eviction just drops RAM. Idempotent. The `PerformScope` gates this to
     /// inside `perform` — the same domain as `advance`/`release`, now enforced by the type system.
+//    public func evictSessions(
+//        _ sessions: SessionStore,
+//        overBudget budgetBytes: Int,
+//        keep: UUID,
+//        scope: borrowing PerformScope
+//    ) {
+//        for id in sessions.victimsOverBudget(budgetBytes, excluding: keep) { sessions.release(id) }
+//    }
+    @discardableResult
     public func evictSessions(
         _ sessions: SessionStore,
         overBudget budgetBytes: Int,
         keep: UUID,
         scope: borrowing PerformScope
-    ) {
-        for id in sessions.victimsOverBudget(budgetBytes, excluding: keep) { sessions.release(id) }
+    ) -> (before: Int, after: Int, evicted: Int) {
+        let before = sessions.residentBytes
+        let victims = sessions.victimsOverBudget(budgetBytes, excluding: keep)
+        for id in victims { sessions.release(id) }
+        return (before, sessions.residentBytes, victims.count)
     }
 }
