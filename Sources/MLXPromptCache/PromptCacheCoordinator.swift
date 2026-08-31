@@ -19,6 +19,34 @@ public enum PromptCacheOutcome: Sendable {
     case uncacheable(reason: String)    // prompt < one block, pure-SSM, or the prefill didn't land
 }
 
+/// What `advance` did with the caches it was offered — the congruence report for the consumer's log.
+/// `Sendable` (pure values).
+///
+/// Both optional fields are `nil` on a healthy turn. When either is set, the consumer has learned
+/// something it can act on: the prompt it presented is not the prompt its cache was built from, and
+/// the usual cause is that the model's chat template renders the same conversation two different
+/// ways. That is worth logging loudly, because the fix is a per-model one and there is no way to
+/// discover it except by being told.
+public struct SessionAdvanceReport: Sendable {
+    /// Tokens the returned cache already covers — what this turn does not have to prefill.
+    public let coveredTokens: Int
+    /// Set when a held session was DROPPED because this prompt no longer carried the prompt the
+    /// cache was built from. The value is the first token index where the two part company.
+    public let heldDivergedAt: Int?
+    /// How far the durable root and this prompt actually agree, and how long the root is. When the
+    /// first is far below the second, the root was rendered differently from the prompt and only
+    /// the agreeing part was eligible to seed.
+    public let rootCommonPrefix: Int
+    public let rootTokens: Int
+
+    public init(coveredTokens: Int, heldDivergedAt: Int?, rootCommonPrefix: Int, rootTokens: Int) {
+        self.coveredTokens = coveredTokens
+        self.heldDivergedAt = heldDivergedAt
+        self.rootCommonPrefix = rootCommonPrefix
+        self.rootTokens = rootTokens
+    }
+}
+
 /// Why `warm` returned what it did. `Sendable` (pure values).
 public enum PromptWarmOutcome: Sendable {
     /// The prefix is cached to its last full block. `prefilled == 0` means the catalog already
@@ -355,13 +383,37 @@ extension PromptCacheCoordinator {
         model: any LanguageModel,
         parameters: GenerateParameters,
         scope: borrowing PerformScope
-    ) -> (input: LMInput, cache: [KVCache]) {
-        sessions.advance(
+    ) -> (input: LMInput, cache: [KVCache], report: SessionAdvanceReport) {
+        // SEED GUARD. The root is a legitimate seed only as far as it actually leads this prompt.
+        //
+        // Handing the WHOLE root to `reuse` asks the catalog the wrong question. The catalog is
+        // content-addressed over the root's own tokens, so it will happily match thousands of them
+        // — and then the delta is cut from the PROMPT, which may share almost none of them. That is
+        // how a cache built from a differently-rendered root came to restore 60,416 tokens of state
+        // for a prompt that agreed with it on one. Every block hash was correct; the question was
+        // not.
+        //
+        // Clamping to the common prefix makes the wrong answer unreachable rather than merely
+        // unlikely: `reuse` hashes whole blocks from index 0 of the array it is given, so it cannot
+        // return more than the clamp, and a clamp below one block yields no hashes and therefore no
+        // seed at all.
+        var common = 0
+        let limit = min(rootTokens.count, fullPromptTokens.count)
+        while common < limit, rootTokens[common] == fullPromptTokens[common] { common += 1 }
+        let leadingRoot = Array(rootTokens.prefix(common))
+
+        let advanced = sessions.advance(
             id: id,
             fullPromptTokens: fullPromptTokens,
-            warmRoot: { store.reuse(forTokens: rootTokens) },
+            warmRoot: { store.reuse(forTokens: leadingRoot) },
             makeCache: { makePromptCache(model: model, parameters: parameters) }
         )
+        let delta = advanced.input.text.tokens.shape.last ?? 0
+        return (advanced.input, advanced.cache, SessionAdvanceReport(
+            coveredTokens: fullPromptTokens.count - delta,
+            heldDivergedAt: advanced.divergedAt,
+            rootCommonPrefix: common,
+            rootTokens: rootTokens.count))
     }
 
     /// Free conversation `id`'s live cache. Idempotent. The `PerformScope` gates this to inside `perform`.

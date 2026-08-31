@@ -271,7 +271,7 @@ for model in models {
         let held: ConvOut = try await mc.perform { context in
             let scope = coordinator.scope(context)
             // Turn 1 — whole document resident (seeded from the warm root), only the question prefills.
-            let (d1in, cache1) = coordinator.advance(sessions, id: convId,
+            let (d1in, cache1, _) = coordinator.advance(sessions, id: convId,
                 fullPromptTokens: document + qTokens, rootTokens: document,
                 model: context.model, parameters: convParams, scope: scope)
             let d1 = d1in.text.tokens.shape.last ?? 0
@@ -280,7 +280,7 @@ for model in models {
                 if case .token(let tok) = g { if a1.isEmpty { ttft1 = Date().timeIntervalSince(t1) * 1000 }; a1.append(tok) }
             }
             // Turn 2 — same id ⇒ the SAME live cache (document+Q1+A1 resident); only Q2 prefills.
-            let (d2in, cache2) = coordinator.advance(sessions, id: convId,
+            let (d2in, cache2, _) = coordinator.advance(sessions, id: convId,
                 fullPromptTokens: document + qTokens + a1 + qbTokens, rootTokens: document,
                 model: context.model, parameters: convParams, scope: scope)
             let d2 = d2in.text.tokens.shape.last ?? 0

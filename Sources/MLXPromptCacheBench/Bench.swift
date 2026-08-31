@@ -72,7 +72,7 @@ struct ModelSpec: Sendable {
         linearLayers: 0, valueHeads: 0, keyHeadDim: 0, valueHeadDim: 0,
         maxContext: 32_768)
 
-    static let all = [qwen35B, qwen9B, qwen17B, glm32B]
+    static let all = [qwen35B, qwen9B]
 
     static func named(_ s: String) -> ModelSpec? {
         all.first { $0.short.lowercased() == s.lowercased() || $0.id == s }

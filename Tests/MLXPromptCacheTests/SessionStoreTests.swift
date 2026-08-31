@@ -24,7 +24,7 @@ struct SessionStoreTests {
     private func runTurn(_ sessions: SessionStore, id: UUID, model: StubModel,
                          fullPrompt: [Int], answerLen: Int,
                          warmRoot: () -> Reused?, makeCache: () -> [KVCache]) -> (Int, [KVCache]) {
-        let (delta, cache) = sessions.advance(id: id, fullPromptTokens: fullPrompt,
+        let (delta, cache, _) = sessions.advance(id: id, fullPromptTokens: fullPrompt,
                                               warmRoot: warmRoot, makeCache: makeCache)
         _ = model.callAsFunction(delta.text, cache: cache, state: nil)                    // prefill the delta
         if answerLen > 0 {
@@ -42,7 +42,7 @@ struct SessionStoreTests {
                                           parameters: GenerateParameters())
         else { Issue.record("warm did not complete"); return }
         let sessions = SessionStore()
-        let (_, cache) = sessions.advance(id: UUID(), fullPromptTokens: root,
+        let (_, cache, _) = sessions.advance(id: UUID(), fullPromptTokens: root,
             warmRoot: { store.reuse(forTokens: root) },
             makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         #expect(PromptCacheIO.tokenLength(cache) == 512)
@@ -54,7 +54,7 @@ struct SessionStoreTests {
         let root = Fixture.tokens(600)
         _ = coord.warm(promptTokens: root, model: twoLayerModel(), parameters: GenerateParameters())
         let sessions = SessionStore()
-        let (delta, _) = sessions.advance(id: UUID(), fullPromptTokens: Fixture.tokens(512 + 20),
+        let (delta, _, _) = sessions.advance(id: UUID(), fullPromptTokens: Fixture.tokens(512 + 20),
             warmRoot: { store.reuse(forTokens: root) },
             makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         #expect((delta.text.tokens.shape.last ?? 0) == 20)
@@ -116,34 +116,43 @@ struct SessionStoreTests {
     // 5 — no warm root: the first advance is the whole prompt.
     @Test func emptySeedFirstAdvanceIsFullPrompt() {
         let sessions = SessionStore()
-        let (delta, _) = sessions.advance(id: UUID(), fullPromptTokens: Fixture.tokens(30),
+        let (delta, _, _) = sessions.advance(id: UUID(), fullPromptTokens: Fixture.tokens(30),
             warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         #expect((delta.text.tokens.shape.last ?? 0) == 30)
     }
 
     // 6 — a prompt shorter than the resident cache clamps rather than underflowing.
-    @Test func divergedPrefixClamps() {
+    @Test func divergedPrefixIsRefusedAndReseeded() {
         let model = twoLayerModel()
         let sessions = SessionStore()
         let id = UUID()
-        let (_, cache) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(40),
+        let (_, cache, _) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(40),
             warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         _ = model.callAsFunction(LMInput(tokens: MLXArray(Fixture.tokens(40))).text, cache: cache, state: nil)
-        let (delta, _) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(25),
-            warmRoot: { nil }, makeCache: { [] as [KVCache] })                            // not re-seeded (already live)
-        #expect((delta.text.tokens.shape.last ?? 0) == 0)
+        // This test used to assert the OPPOSITE: that a diverged prefix clamped to an EMPTY delta.
+        // That was the defect, not the contract. An empty delta is not a safe outcome — generating
+        // on an empty input traps inside MLX's C++ reshape, which is why every consumer had to grow
+        // its own guard against it. A prompt shorter than the cache means the cache covers tokens
+        // this prompt does not have, so the session is dropped and reseeded instead.
+        var reseeded = false
+        let (delta, _, divergedAt) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(25),
+            warmRoot: { nil },
+            makeCache: { reseeded = true; return [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        #expect(divergedAt == 25)
+        #expect(reseeded)
+        #expect((delta.text.tokens.shape.last ?? 0) == 25)
     }
 
     // 7 — release frees the cache (and is idempotent): a later advance for the same id RE-SEEDS.
     @Test func releaseFreesCache() {
         let sessions = SessionStore()
         let id = UUID()
-        let (_, cache) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(30),
+        let (_, cache, _) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(30),
             warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         #expect(cache.isEmpty == false)
         sessions.release(id)
         var reseeded = false
-        let (_, cache2) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(10),
+        let (_, cache2, _) = sessions.advance(id: id, fullPromptTokens: Fixture.tokens(10),
             warmRoot: { nil }, makeCache: { reseeded = true; return [KVCacheSimple()] as [KVCache] })
         #expect(reseeded)                                                                 // entry was dropped → makeCache ran
         #expect(PromptCacheIO.tokenLength(cache2) == 0)                                    // brand-new empty cache
@@ -162,7 +171,7 @@ struct SessionStoreTests {
         let id = UUID()
         let scope = PerformScope()
 
-        let (delta, cache) = coord.advance(sessions, id: id,
+        let (delta, cache, _) = coord.advance(sessions, id: id,
                                            fullPromptTokens: Fixture.tokens(512 + 20),
                                            rootTokens: root, model: twoLayerModel(),
                                            parameters: GenerateParameters(), scope: scope)
@@ -172,7 +181,7 @@ struct SessionStoreTests {
         coord.release(sessions, id: id, scope: scope)
         // After release the entry is gone, so the next advance re-seeds from the root rather than resuming.
         var reseeded = false
-        let (_, cache2) = sessions.advance(id: id, fullPromptTokens: root,
+        let (_, cache2, _) = sessions.advance(id: id, fullPromptTokens: root,
             warmRoot: { reseeded = true; return store.reuse(forTokens: root) },
             makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
         #expect(reseeded)                                                                  // release dropped the live entry
@@ -184,7 +193,13 @@ struct SessionStoreTests {
     /// Seed conversation `id` with a specific cache (no prefill, no root) so its footprint is known.
     @discardableResult
     private func seed(_ sessions: SessionStore, _ id: UUID, cache: [KVCache]) -> [KVCache] {
-        sessions.advance(id: id, fullPromptTokens: [], warmRoot: { nil }, makeCache: { cache }).cache
+        // Present a prompt that MATCHES the cache being seeded. The congruence guard compares the
+        // next advance against whatever was presented here, so seeding with an empty prompt would
+        // make every later advance look like a divergence — a shortcut the old permissive advance
+        // allowed and this one correctly refuses.
+        let tokens = Fixture.tokens(PromptCacheIO.tokenLength(cache) ?? 0)
+        return sessions.advance(id: id, fullPromptTokens: tokens,
+                                warmRoot: { nil }, makeCache: { cache }).cache
     }
 
     private func snapshotCount(in dir: URL) -> Int {
@@ -250,12 +265,12 @@ struct SessionStoreTests {
         #expect(snapshotCount(in: dir) == 0)                                    // NO persist-before-release
         // `keep` is still live (advance does not re-seed it)…
         var keepReseeded = false
-        _ = sessions.advance(id: keep, fullPromptTokens: [], warmRoot: { nil },
+        _ = sessions.advance(id: keep, fullPromptTokens: Fixture.tokens(256), warmRoot: { nil },
                              makeCache: { keepReseeded = true; return [] as [KVCache] })
         #expect(keepReseeded == false)
         // …while the evicted victim re-seeds on its next advance.
         var victimReseeded = false
-        _ = sessions.advance(id: victim, fullPromptTokens: [], warmRoot: { nil },
+        _ = sessions.advance(id: victim, fullPromptTokens: Fixture.tokens(1024), warmRoot: { nil },
                              makeCache: { victimReseeded = true; return Fixture.syntheticCache(tokens: 256) })
         #expect(victimReseeded)
     }
@@ -277,5 +292,107 @@ struct SessionStoreTests {
         let afterFirstEvict = sessions.residentBytes
         coord.evictSessions(sessions, overBudget: 1, keep: keep, scope: scope)            // idempotent
         #expect(sessions.residentBytes == afterFirstEvict)
+    }
+
+    // MARK: - Congruence guard (0.5.7)
+
+    // A resumed turn whose prompt no longer carries the prompt the cache was built from must be
+    // refused, not sliced by length. This is the shape a chat template creates when it re-renders a
+    // past assistant turn differently from the way it was generated.
+    @Test func heldSessionThatNoLongerLeadsThePromptIsDroppedAndReported() throws {
+        let sessions = SessionStore()
+        let model = twoLayerModel()
+        let id = UUID()
+        let turn1 = Fixture.tokens(600)
+        runTurn(sessions, id: id, model: model, fullPrompt: turn1, answerLen: 40,
+                warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        // Turn 2 keeps the first 500 tokens and then differs — the template dropped something.
+        var turn2 = Array(turn1.prefix(500))
+        turn2.append(contentsOf: Fixture.tokens(300).map { $0 &+ 1 })
+        let (delta, cache, divergedAt) = sessions.advance(
+            id: id, fullPromptTokens: turn2,
+            warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        #expect(divergedAt == 500)
+        // Dropped and reseeded cold: nothing was resident, so the whole prompt is the delta.
+        #expect(PromptCacheIO.tokenLength(cache) == 0)
+        #expect((delta.text.tokens.shape.last ?? 0) == turn2.count)
+    }
+
+    // The healthy case must stay silent — a prompt that extends the previous one reports nothing.
+    @Test func heldSessionThatStillLeadsThePromptReportsNoDivergence() throws {
+        let sessions = SessionStore()
+        let model = twoLayerModel()
+        let id = UUID()
+        let turn1 = Fixture.tokens(600)
+        let (_, cache) = runTurn(sessions, id: id, model: model, fullPrompt: turn1, answerLen: 40,
+                                 warmRoot: { nil },
+                                 makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        let resident = PromptCacheIO.tokenLength(cache) ?? 0
+        // Turn 2 = everything the cache holds, plus a new question.
+        let turn2 = Fixture.tokens(resident + 30)
+        let (delta, cache2, divergedAt) = sessions.advance(
+            id: id, fullPromptTokens: turn2,
+            warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        #expect(divergedAt == nil)
+        #expect(PromptCacheIO.tokenLength(cache2) == resident)
+        #expect((delta.text.tokens.shape.last ?? 0) == 30)
+    }
+
+    // A prompt SHORTER than the cache is a divergence too — the old code clamped it to an empty
+    // delta, and generating on an empty input traps inside MLX rather than throwing.
+    @Test func promptShorterThanTheCacheIsTreatedAsDivergence() throws {
+        let sessions = SessionStore()
+        let model = twoLayerModel()
+        let id = UUID()
+        runTurn(sessions, id: id, model: model, fullPrompt: Fixture.tokens(600), answerLen: 40,
+                warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        let short = Fixture.tokens(100)
+        let (delta, _, divergedAt) = sessions.advance(
+            id: id, fullPromptTokens: short,
+            warmRoot: { nil }, makeCache: { [KVCacheSimple(), KVCacheSimple()] as [KVCache] })
+        #expect(divergedAt == 100)
+        #expect((delta.text.tokens.shape.last ?? 0) == 100)
+    }
+
+    // The seed guard: a durable root that does not lead the prompt must not seed it, however many
+    // blocks of the root the catalog happens to hold.
+    @Test func rootThatDoesNotLeadThePromptIsRefusedAsASeed() throws {
+        let (_, _, coord) = try makeStore()
+        let root = Fixture.tokens(1200)
+        guard case .complete = coord.warm(promptTokens: root, model: twoLayerModel(),
+                                          parameters: GenerateParameters())
+        else { Issue.record("warm did not complete"); return }
+        // The prompt shares ONE token with the root — the shape the 27B produced when its template
+        // put a system block at the head of the warm and not of the turn.
+        var prompt = [root[0]]
+        prompt.append(contentsOf: Fixture.tokens(1199).map { $0 &+ 7 })
+        let sessions = SessionStore()
+        let (delta, cache, report) = coord.advance(
+            sessions, id: UUID(), fullPromptTokens: prompt, rootTokens: root,
+            model: twoLayerModel(), parameters: GenerateParameters(),
+            scope: PerformScope())
+        #expect(report.rootCommonPrefix == 1)
+        #expect(report.coveredTokens == 0)
+        #expect(PromptCacheIO.tokenLength(cache) == 0)
+        #expect((delta.text.tokens.shape.last ?? 0) == prompt.count)
+    }
+
+    // And the same door still seeds normally when the root DOES lead the prompt.
+    @Test func rootThatLeadsThePromptStillSeeds() throws {
+        let (_, _, coord) = try makeStore()
+        let root = Fixture.tokens(1200)
+        guard case .complete = coord.warm(promptTokens: root, model: twoLayerModel(),
+                                          parameters: GenerateParameters())
+        else { Issue.record("warm did not complete"); return }
+        let prompt = root + Fixture.tokens(20)
+        let sessions = SessionStore()
+        let (_, cache, report) = coord.advance(
+            sessions, id: UUID(), fullPromptTokens: prompt, rootTokens: root,
+            model: twoLayerModel(), parameters: GenerateParameters(),
+            scope: PerformScope())
+        #expect(report.rootCommonPrefix == root.count)
+        #expect(report.heldDivergedAt == nil)
+        #expect(PromptCacheIO.tokenLength(cache) == 1024)   // 1200 → last full 256-block
+        #expect(report.coveredTokens == 1024)
     }
 }
