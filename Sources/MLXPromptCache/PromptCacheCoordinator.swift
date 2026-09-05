@@ -137,12 +137,8 @@ public final class PromptCacheCoordinator: Sendable {
         model: any LanguageModel,
         stepSize: Int
     ) {
-        let input = LMInput(tokens: MLXArray(tokens))
-        guard let result = try? model.prepare(input, cache: cache, windowSize: stepSize) else { return }
-        if case let .tokens(remaining) = result {
-            _ = model(remaining[text: .newAxis], cache: cache, state: nil)
-        }
-        eval(cache.flatMap { $0.state })
+        ChunkedPrefill.run(tokens, into: cache, model: model,
+                           pieceSize: tokens.count, windowSize: stepSize)
     }
 }
 
@@ -209,21 +205,8 @@ extension PromptCacheCoordinator {
         shouldPause: () -> Bool
     ) -> Int {
         let chunk = max(store.blockSize, (stepSize / store.blockSize) * store.blockSize)
-        var offset = start
-        while offset < tokens.count {
-            if offset > start, shouldPause() { return offset }
-            let end = min(offset + chunk, tokens.count)
-            let piece = LMInput(tokens: MLXArray(Array(tokens[offset ..< end])))
-            guard let result = try? model.prepare(piece, cache: cache, windowSize: stepSize) else {
-                return offset
-            }
-            if case let .tokens(remaining) = result {
-                _ = model(remaining[text: .newAxis], cache: cache, state: nil)
-            }
-            eval(cache.flatMap { $0.state })
-            offset = end
-        }
-        return offset
+        return ChunkedPrefill.run(tokens, into: cache, from: start, model: model,
+                                  pieceSize: chunk, windowSize: stepSize, shouldPause: shouldPause)
     }
 }
 

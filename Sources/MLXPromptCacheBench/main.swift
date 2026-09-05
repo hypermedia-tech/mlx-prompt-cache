@@ -274,16 +274,16 @@ for spec in opts.models {
     let question = await mc.encode("\n\nQ: one sentence — most suspicious behaviour?\nA:")
 
     // Not every phase needs production scale. G2/G3 measure I/O volume, which is the whole point of
-    // a large T; the isolated persist measurement needs it too, because persist cost scales with
-    // snapshot size. But G4 is a correctness gate, G5's canary just needs SOME MLX work running to
-    // sample the lock, and G6 is a boolean about whether a tier populates — running those at 183k
-    // costs four extra full-length prefills and proves nothing extra. Pin them.
+    // a large T; the isolated persist measurement (and the eval-lock canary that brackets it) needs
+    // it too, because persist cost scales with snapshot size. But G4 is a correctness gate and G6 is
+    // a boolean about whether a tier populates — running those at 183k costs extra full-length
+    // prefills and proves nothing extra. Pin them.
     let probeBoundary = min((T - 1) / blockSize * blockSize, (16_384 / blockSize) * blockSize)
     let probePrompt = Array(tokens.prefix(probeBoundary + 1))
     let probeRounds = 4
     let probeChunks = max(1, probeBoundary / (probeRounds * blockSize))
     if probeBoundary < (T - 1) / blockSize * blockSize {
-        print("  scale: G2/G3/G5-persist at \((T - 1) / blockSize * blockSize) tokens · G4/G5-canary/G6 at \(probeBoundary) (correctness + boolean gates, scale-invariant)")
+        print("  scale: G2/G3/G5 at \((T - 1) / blockSize * blockSize) tokens · G4/G6 at \(probeBoundary) (correctness + boolean gates, scale-invariant)")
     }
 
     // Warm up Metal so the first timing is not one-time init.
@@ -360,8 +360,9 @@ for spec in opts.models {
     let boundary = (T - 1) / blockSize * blockSize
 
 
-    /// Status-quo arm: today's `warm`, called once per resume. Each call re-enters `store.reuse`
-    /// (loading the whole previous snapshot) and ends in a whole-prefix `record`.
+    /// Status-quo arm: the non-resident `warm`, called once per resume. Each call re-enters
+    /// `store.reuse` (reassembling the whole delta chain written so far) and ends in a `record` of
+    /// its new range — plus the whole recurrent state, on a hybrid.
     func runStatusQuo() async throws -> ArmResult {
         let dir = Scratch.store("sq-\(spec.short)")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -407,8 +408,10 @@ for spec in opts.models {
                 throw BenchError.silentRefusal("status-quo round \(round): \(probe.refusals)")
             }
             let after = Census.of(dir)
-            // The snapshot `reuse` actually read, sized before the call overwrote the directory.
-            let readBytes = probe.loadedFiles.reduce(0) { $0 + before.size($1) }
+            // What `reuse` actually read, sized before the call added to the directory. A delta chain
+            // is logged as one `reassembled` event without its file names, so it is costed as every
+            // snapshot file present before the call — exact here, where the directory holds one chain.
+            let readBytes = before.bytesLoaded(probe.loadedFiles)
             // Force the write to the device and time it separately — `write()` alone only reaches
             // the page cache, so any save timing without this is memcpy speed, not disk speed.
             var fsyncMs = 0.0
@@ -502,7 +505,7 @@ for spec in opts.models {
             arm.samples.append(ResumeSample(
                 round: round, reachedTokens: got,
                 logicalWriteBytes: probe.savedBytes,
-                logicalReadBytes: probe.loadedFiles.reduce(0) { $0 + before.size($1) },
+                logicalReadBytes: before.bytesLoaded(probe.loadedFiles),
                 saveCount: probe.saveCount, loadCount: probe.loadCount,
                 wallMs: wall, fsyncMs: fs,
                 deviceReadBytes: max(0, io1.bytesRead - io0.bytesRead),
@@ -586,11 +589,12 @@ for spec in opts.models {
     let sqRoundTrip = sq.totalLogicalWrite + sq.totalLogicalRead
     print("    TOTAL logical write \(fmtBytes(sq.totalLogicalWrite)) + read \(fmtBytes(sq.totalLogicalRead)) = \(fmtBytes(sqRoundTrip))")
     print("    TOTAL device  write \(fmtBytes(sq.totalDeviceWrite)) + read \(fmtBytes(sq.totalDeviceRead))")
-    // The disease is a COUNT, not a curve: R loads and R saves of the whole prefix.
+    // The disease is a COUNT, not a curve: R reloads of the whole prefix (the delta chain
+    // reassembled) and R saves — each a delta range plus, on a hybrid, the whole recurrent state.
     rep.gates.append(gate("G2.loads", sq.samples.dropFirst().allSatisfy { $0.loadCount == 1 },
-                          "every resume after the first reloads the whole prefix"))
+                          "every resume after the first reloads the whole prefix (delta chain reassembled)"))
     rep.gates.append(gate("G2.saves", sq.samples.allSatisfy { $0.saveCount == 1 },
-                          "every resume rewrites a whole-prefix snapshot"))
+                          "every resume writes one snapshot (its delta range + the recurrent state)"))
     if sq.totalLogicalRead > 0, sq.totalDeviceRead * 4 < sq.totalLogicalRead {
         let note = "page cache served the re-reads: logical \(fmtBytes(sq.totalLogicalRead)) vs device \(fmtBytes(sq.totalDeviceRead)) — the read half of the disease is largely absorbed by RAM on this host"
         print("    ⚠️  \(note)")
@@ -714,6 +718,7 @@ for spec in opts.models {
     print("\n  ── G5 persist cost ──")
     // Isolate the write from the prefill: warm to a pause, then time `finishWarm` ALONE. That is
     // also the real abandonment path, so this measures shipped behaviour rather than a proxy.
+    var canaryGaps: [Double]?
     do {
         let dir = Scratch.store("persist-\(spec.short)")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -741,9 +746,27 @@ for spec in opts.models {
         }
         probe.reset()
         let before = Census.of(dir)
+        // The eval-lock canary brackets `finishWarm` and NOTHING else, so its widest gap is the
+        // save's hold on the process-global lock. An earlier cut ran it across a whole warm, and
+        // its "max stall during a save" was a prefill chunk. It allocates ONCE outside its loop so
+        // it times eval() only and does not churn the Metal buffer cache.
+        let stop = Mutex(false)
+        let canary: Task<[Double], Never>? = opts.skipCanary ? nil : Task.detached { () -> [Double] in
+            let a = MLXArray([1.0 as Float])
+            eval(a)
+            var gaps: [Double] = []
+            while !stop.withLock({ $0 }) {
+                let t = ContinuousClock.now
+                eval(a)
+                gaps.append((ContinuousClock.now - t).ms)
+            }
+            return gaps
+        }
         let t0 = ContinuousClock.now
         _ = await mc.perform { ctx in coord.finishWarm(warms, id: id, model: ctx.model, scope: coord.scope(ctx)) }
         let recMs = (ContinuousClock.now - t0).ms
+        stop.withLock { $0 = true }
+        canaryGaps = await canary?.value
         guard probe.saveCount == 1, probe.refusals.isEmpty else {
             throw BenchError.silentRefusal("finishWarm saved \(probe.saveCount) \(probe.refusals)")
         }
@@ -760,37 +783,12 @@ for spec in opts.models {
         print("    ⇒ the process-global eval lock is held for the record portion: \(fmtMs(rec))")
         rep.gates.append(gate("G5.measured", rec > 0, "persist cost measured"))
     }
-    if !opts.skipCanary {
-        // Separate phase, nothing else running. The canary allocates ONCE outside its loop so it
-        // times eval() only and does not churn the Metal buffer cache.
-        let stop = Mutex(false)
-        let canary = Task.detached { () -> [Double] in
-            let a = MLXArray([1.0 as Float])
-            eval(a)
-            var gaps: [Double] = []
-            while !stop.withLock({ $0 }) {
-                let t = ContinuousClock.now
-                eval(a)
-                gaps.append((ContinuousClock.now - t).ms)
-            }
-            return gaps
-        }
-        let dir = Scratch.store("canary-\(spec.short)")   // probe scale: the canary only needs MLX work running
-        let probe = IOProbe()
-        let store = try PromptCacheStore(directory: dir, budgetBytes: 1 << 40, signature: sig,
-                                         blockSize: blockSize, hotBudgetBytes: 0, log: probe.sink)
-        let coord = PromptCacheCoordinator(store: store)
-        _ = await mc.perform { ctx in
-            coord.warm(promptTokens: probePrompt, model: ctx.model, parameters: params)
-        }
-        stop.withLock { $0 = true }
-        let gaps = await canary.value
+    if let gaps = canaryGaps {
         rep.evalStallMaxMs = gaps.max() ?? 0
         print(String(format: "    eval-lock canary: %d samples, max stall %.0f ms, median %.2f ms",
                      gaps.count, rep.evalStallMaxMs, median(gaps)))
         rep.gates.append(gate("G5.evalStall", !gaps.isEmpty,
-                              String(format: "max process-global MLX stall during a save: %.0f ms", rep.evalStallMaxMs)))
-        try? FileManager.default.removeItem(at: dir)
+                              String(format: "max process-global MLX stall during the save: %.0f ms", rep.evalStallMaxMs)))
     }
 
     // ── G6 · hot tier expectation, asserted on EVERY model ──────────────────────────────────

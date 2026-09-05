@@ -229,7 +229,7 @@ struct ResumeSample: Sendable, Codable {
     var round: Int
     var reachedTokens: Int
     var logicalWriteBytes: Int      // from the store's own sink: exact, but page-cache-absorbed
-    var logicalReadBytes: Int       // size of the snapshot `reuse` loaded whole
+    var logicalReadBytes: Int       // bytes `reuse` read — the whole delta chain on a resume
     var saveCount: Int
     var loadCount: Int
     var wallMs: Double              // whole warm call, inside perform
@@ -275,6 +275,14 @@ struct Census: Sendable {
 
     func size(_ name: String) -> Int { sizes[name] ?? 0 }
     func newFiles(vs old: Census) -> [String] { sizes.keys.filter { old.sizes[$0] == nil }.sorted() }
+
+    /// Bytes a `reuse` read. A named file is its size; a delta chain — which the store logs as one
+    /// `reassembled` event without naming its links (`IOProbe` records it as "chain") — is every
+    /// snapshot file present before the call. Exact for the arms here: each has its own directory
+    /// holding exactly one chain. Before this, a chain reload costed 0 B and the read column lied.
+    func bytesLoaded(_ files: [String]) -> Int {
+        files.reduce(0) { $0 + ($1 == "chain" ? total : size($1)) }
+    }
 }
 
 // MARK: - State comparison (the sensitive H4 observable)
